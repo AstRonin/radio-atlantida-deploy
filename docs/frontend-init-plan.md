@@ -145,7 +145,7 @@ radio-atlantida-frontend/
   eslint.config.mjs
   package.json
   package-lock.json
-  proxy.conf.json                   # dev server proxy to the backend on 127.0.0.1:8080
+  proxy.conf.json                   # dev server proxy to the backend on 127.0.0.1:8090
   tsconfig.json
   README.md
 ```
@@ -164,9 +164,9 @@ Tasks:
 4. Unit test runner set up with one passing smoke test.
 5. `app.config.ts`: router, `HttpClient` with interceptors, global error handler, translation loader (1.3). No feature routes yet. The language switch is added to the header with the shell.
 6. Application shell (`core/shell`): a header with the station name placeholder, a side navigation listing only the pages whose phase is done, and a content area. The layout works at desktop widths; narrow widths are supported but not optimized.
-7. Dev proxy: `proxy.conf.json` forwards `/api` (including the WebSocket path `/api/ws`) to `http://127.0.0.1:8080`. The app uses relative URLs (`/api/...`), so the same code works in development, in the Docker stack, and in production.
+7. Dev proxy: `proxy.conf.json` forwards `/api` (including the WebSocket path `/api/ws`) to `http://127.0.0.1:8090`. The app uses relative URLs (`/api/...`), so the same code works in development, in the Docker stack, and in production.
 8. `docker/Dockerfile`: multi-stage. Build stage on the pinned Node LTS image (`npm ci`, build). Runtime stage on an unprivileged nginx image, serving the static build on port 8080 with SPA fallback to `index.html`. `HEALTHCHECK` on `/`.
-9. `docker/nginx.conf`: serves static files, proxies `/api/` to `http://backend:8080` (the Compose service name), including the WebSocket upgrade headers for `/api/ws`. Security headers: `X-Content-Type-Options`, `Referrer-Policy`, and a `Content-Security-Policy` that allows self-hosted assets and `connect-src 'self'`.
+9. `docker/nginx.conf`: serves static files, proxies `/api/` to `http://backend:8090` (the Compose service name), including the WebSocket upgrade headers for `/api/ws`. Security headers: `X-Content-Type-Options`, `Referrer-Policy`, and a `Content-Security-Policy` that allows self-hosted assets and `connect-src 'self'`.
 10. npm scripts as the entry point: `dev`, `lint`, `format:check`, `test`, `build`, `api:sync`, `api:generate` (see 9.5).
 11. `.github/workflows/ci.yml`: on every PR, `npm ci`, lint, format check, typecheck, unit tests, production build, `npm audit --audit-level=high`.
 12. `CLAUDE.md` in the repository root, so every later session works with the same context and conventions:
@@ -311,7 +311,7 @@ Tasks:
 
 ### 9.4 Dev stack and proxying
 
-- **Development proxy — DEFAULT.** `proxy.conf.json` forwards `/api` (including `/api/ws`) to `127.0.0.1:8080`, which is where `make run` starts the backend (backend plan, Phase 1, task 9). The developer does not change any URL in code.
+- **Development proxy — DEFAULT.** `proxy.conf.json` forwards `/api` (including `/api/ws`) to `127.0.0.1:8090`, which is where `make run` starts the backend (backend plan, Phase 1, task 9). The developer does not change any URL in code.
 - **Production-like run — DEFAULT.** The frontend container's nginx proxies `/api` to the `backend` service on the internal Compose network (Section 3, task 9). The browser only ever talks to one origin, so no CORS configuration is needed.
 
 ### 9.5 Tooling entry point — DEFAULT
