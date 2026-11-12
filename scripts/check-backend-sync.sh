@@ -22,6 +22,8 @@ set -Eeuo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # shellcheck source=scripts/lib/backend-source.sh
 source "$root/scripts/lib/backend-source.sh"
+# shellcheck source=scripts/lib/contract.sh
+source "$root/scripts/lib/contract.sh"
 
 usage() {
   cat <<'EOF'
@@ -105,8 +107,7 @@ check_same() {
 
 check_contract() {
   local f=$root/config/liquidsoap/radio.liq
-  if ! grep -Eq '^# radio-atlantida-contract: [0-9]+$' "$f" ||
-    ! grep -Eq '^# min-backend: [0-9]+\.[0-9]+\.[0-9]+$' "$f"; then
+  if ! script_contract "$f" >/dev/null || ! script_min_backend "$f" >/dev/null; then
     report "config/liquidsoap/radio.liq has no contract header (radio-atlantida-contract, min-backend)"
   fi
 }
