@@ -1,0 +1,22 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+# Windows scripts: CRLF (deploy-init-plan.md §1, 11.8).
+[*.{bat,ps1}]
+end_of_line = crlf
+
+# Windows PowerShell 5.1 reads BOM-less files as ANSI (deploy-init-plan.md §1.1).
+[*.ps1]
+charset = utf-8-bom
+
+[*.{yml,yaml}]
+indent_style = space
+indent_size = 2
+
+[*.md]
+trim_trailing_whitespace = false

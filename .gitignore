@@ -1,1 +1,14 @@
+# Per-machine configuration and secrets (template: .env.example)
+.env
+
+# Runtime state of bin/radioctl (deploy-init-plan.md §2)
+state.json
+state.lock
+runtime/
+backups/
+logs/
+*.dump
+
+# OS files
 .DS_Store
+Thumbs.db
