@@ -1,0 +1,1843 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2016 # jq filters are single-quoted on purpose
+# radioctl: the update tool of the Radio Atlantida production stack
+# (deploy-init-plan.md D5 §7, docs/tech-design.md §9.2). It runs inside the
+# radio-atlantida WSL distribution as the user radio; update.bat calls it
+# through wsl.exe. It is the only way to change the production stack: it
+# records in state.json what a rollback and a restore need.
+#
+#   radioctl [options] update [<backendTag> [<frontendTag>]]
+#   radioctl [options] rollback
+#   radioctl [options] restore [<dump>]
+#   radioctl [options] maintenance
+#   radioctl [options] cutover [--undo]
+#   radioctl [options] first-run [--media-root <path>]
+#   radioctl status
+#   radioctl logs [<service>...]
+#   radioctl compose <args>
+#   radioctl backup | restore-drill        (Phase D6, not implemented yet)
+#
+# Options: --dry-run, --yes, --no-wait, --no-fetch, -h/--help (see usage).
+#
+# Rules (plan §1.1): secrets are never printed or logged; .env is parsed,
+# never sourced; every external command's output goes to the run log
+# (logs/<command>-YYYY-MM-DDTHHMMSSZ.log), the console shows the steps and
+# the result; destructive steps need a typed word (RESTORE, MAINTENANCE,
+# CUTOVER), which --yes never answers.
+#
+# Test and dry-run switches (environment, never in .env):
+#   RADIOCTL_ROOT             deploy directory (default: this script's ../)
+#   COMPOSE_PROJECT_NAME      compose project (default: radio-atlantida)
+#   RADIOCTL_BACKEND_IMAGE, RADIOCTL_FRONTEND_IMAGE
+#                             image repositories (default: ghcr.io/astronin/...)
+#   RADIOCTL_COMPOSE_OVERRIDE an extra compose file (a test registry)
+#   RADIOCTL_HEALTH_TIMEOUT   backend health gate in seconds (default 90, min 60)
+#   RADIOCTL_LOCK_WAIT        seconds to wait for state.lock (default 600)
+#   RADIOCTL_FAKE_CLOCK       file holding the epoch seconds; sleeps advance it
+
+set -Eeuo pipefail
+shopt -s inherit_errexit
+
+ORIG_ARGS=("$@")
+SELF=$(readlink -f "${BASH_SOURCE[0]}")
+ROOT=${RADIOCTL_ROOT:-$(cd "$(dirname "$SELF")/.." && pwd)}
+
+# shellcheck source=scripts/lib/contract.sh
+source "$ROOT/scripts/lib/contract.sh"
+
+PROJECT=${COMPOSE_PROJECT_NAME:-radio-atlantida}
+BACKEND_IMAGE=${RADIOCTL_BACKEND_IMAGE:-ghcr.io/astronin/radio-atlantida-backend}
+FRONTEND_IMAGE=${RADIOCTL_FRONTEND_IMAGE:-ghcr.io/astronin/radio-atlantida-frontend}
+COMPOSE_OVERRIDE=${RADIOCTL_COMPOSE_OVERRIDE:-}
+HEALTH_TIMEOUT=${RADIOCTL_HEALTH_TIMEOUT:-90}
+((HEALTH_TIMEOUT >= 60)) || HEALTH_TIMEOUT=60
+LOCK_WAIT=${RADIOCTL_LOCK_WAIT:-600}
+API=http://127.0.0.1:8090
+LISTEN_HINT=https://listen.teploe.net:8001/atlantida
+
+ENV_FILE=$ROOT/.env
+RELEASE_FILE=$ROOT/release.env
+STATE_FILE=$ROOT/state.json
+LOCK_FILE=$ROOT/state.lock
+RUNTIME_DIR=$ROOT/runtime
+APPLIED_ENV=$RUNTIME_DIR/applied.env
+TARGET_ENV=$RUNTIME_DIR/target.env
+NETWORK_ENV=$RUNTIME_DIR/network.env
+LOG_DIR=$ROOT/logs
+SCRIPT_FILE=$ROOT/config/liquidsoap/radio.liq
+
+# The first-run stream output (plan 6.8, 11.14); panel settings afterwards.
+FIRST_RUN_STREAM='{
+  "stream.icecast_host": "listen.teploe.net",
+  "stream.icecast_port": 8001,
+  "stream.mount": "/atlantida",
+  "stream.icecast_tls": true,
+  "stream.codec": "mp3",
+  "stream.bitrate_kbps": 160,
+  "stream.sample_rate_hz": 44100,
+  "stream.channels": 2,
+  "stream.name": "Radio Atlantida"
+}'
+
+DRY_RUN=false
+YES=false
+NO_WAIT=false
+NO_FETCH=${RADIOCTL_NO_FETCH:-false}
+CMD=
+LOG_FILE=/dev/null
+LOG_REL=
+declare -A ENV=()
+
+# ---------------------------------------------------------------------------
+# Output and logging
+
+exec 3>&1 4>&2 5>/dev/null
+
+utc_now() { fmt_time UTC '%Y-%m-%dT%H:%M:%SZ' "$(now)"; }
+utc_stamp() { fmt_time UTC '%Y-%m-%dT%H%M%SZ' "$(now)"; }
+
+log() { printf '%s %s\n' "$(utc_now)" "$*" >&5; }
+say() {
+  printf '%s\n' "$*" >&3
+  log "$*"
+}
+step() { say "==> $*"; }
+warn() {
+  printf 'WARNING: %s\n' "$*" >&3
+  log "WARNING: $*"
+}
+die() {
+  printf 'ERROR: %s\n' "$*" >&4
+  log "ERROR: $*"
+  exit 1
+}
+
+# logrun <command...>: runs it with its output in the run log.
+logrun() {
+  log "+ $*"
+  "$@" >&5 2>&5
+}
+
+# mut <command...>: a command that changes something; printed, not run,
+# with --dry-run.
+mut() {
+  if $DRY_RUN; then
+    case $1 in
+      dc | dct) say "    [dry-run] docker compose ${*:2}" ;;
+      *) say "    [dry-run] $*" ;;
+    esac
+    return 0
+  fi
+  logrun "$@"
+}
+
+open_log() {
+  mkdir -p "$LOG_DIR"
+  local name
+  name="$1-$(utc_stamp)"
+  $DRY_RUN && name+=-dry-run
+  LOG_FILE=$LOG_DIR/$name.log
+  LOG_REL=logs/$name.log
+  exec 5>>"$LOG_FILE"
+  log "radioctl ${ORIG_ARGS[*]} (root $ROOT, project $PROJECT)"
+}
+
+on_error() {
+  log "unexpected error (exit $1) at line $2: $3"
+  printf 'ERROR: unexpected failure at line %s; see %s\n' "$2" "${LOG_REL:-the run log}" >&4
+}
+trap 'on_error $? $LINENO "$BASH_COMMAND"' ERR
+
+# ---------------------------------------------------------------------------
+# Clock (a file in tests, so waits are instant)
+
+now() {
+  if [[ -n ${RADIOCTL_FAKE_CLOCK:-} ]]; then
+    printf '%s' "$(<"$RADIOCTL_FAKE_CLOCK")"
+  else
+    printf '%(%s)T' -1
+  fi
+}
+
+sleep_s() {
+  if [[ -n ${RADIOCTL_FAKE_CLOCK:-} ]]; then
+    printf '%s' "$(($(now) + $1))" >"$RADIOCTL_FAKE_CLOCK"
+  else
+    sleep "$1"
+  fi
+}
+
+# fmt_time <tz> <format> <epoch>
+fmt_time() {
+  (
+    export TZ=$1
+    printf "%($2)T" "$3"
+  )
+}
+
+# ---------------------------------------------------------------------------
+# Files: .env, release.env, runtime/*.env (parsed, never sourced)
+
+# read_kv <file> <assoc name>: KEY=VALUE lines; # comments and blank lines
+# skipped; one level of matching quotes removed.
+read_kv() {
+  local -n _kv=$2
+  local line key val
+  while IFS= read -r line || [[ -n $line ]]; do
+    line=${line%$'\r'}
+    [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
+    [[ $line =~ ^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
+    key=${BASH_REMATCH[2]}
+    val=${BASH_REMATCH[3]}
+    if [[ $val =~ ^\'(.*)\'$ || $val =~ ^\"(.*)\"$ ]]; then
+      val=${BASH_REMATCH[1]}
+    fi
+    _kv["$key"]=$val
+  done <"$1"
+}
+
+envv() { printf '%s' "${ENV[$1]:-${2:-}}"; }
+
+load_env() {
+  [[ -f $ENV_FILE ]] || return 1
+  ENV=()
+  read_kv "$ENV_FILE" ENV
+}
+
+monitoring_enabled() { [[ $(envv MONITORING_ENABLED true) == true ]]; }
+
+REQUIRED_VARS=(GHCR_USER GHCR_READ_TOKEN MEDIA_ROOT PLAYOUT_JOURNAL_ROOT BACKUP_ROOT
+  POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DB ICECAST_SOURCE_PASSWORD
+  LIQUIDSOAP_CONTROL_PASSWORD)
+MONITORING_VARS=(GRAFANA_ADMIN_PASSWORD GRAFANA_DB_PASSWORD)
+
+check_env_vars() {
+  local v missing=()
+  for v in "${REQUIRED_VARS[@]}"; do
+    [[ -n ${ENV[$v]:-} ]] || missing+=("$v")
+  done
+  if monitoring_enabled; then
+    for v in "${MONITORING_VARS[@]}"; do
+      [[ -n ${ENV[$v]:-} ]] || missing+=("$v")
+    done
+  fi
+  ((${#missing[@]} == 0)) || die ".env lacks: ${missing[*]}"
+}
+
+# write_app_env <file> <btag> <bdigest> <ftag> <fdigest>
+write_app_env() {
+  local grafana_url=
+  monitoring_enabled && grafana_url=http://127.0.0.1:$(envv GRAFANA_PORT 3000)
+  if $DRY_RUN; then
+    say "    [dry-run] write ${1#"$ROOT"/}: backend $2, frontend $4"
+    return 0
+  fi
+  mkdir -p "$RUNTIME_DIR"
+  cat >"$1.tmp" <<EOF
+# Written by bin/radioctl $(utc_now); the release compose runs with.
+BACKEND_TAG=$2
+BACKEND_DIGEST=$3
+FRONTEND_TAG=$4
+FRONTEND_DIGEST=$5
+GRAFANA_URL=$grafana_url
+EOF
+  mv "$1.tmp" "$1"
+}
+
+# ---------------------------------------------------------------------------
+# state.json
+
+state_init() {
+  [[ -f $STATE_FILE ]] && return 0
+  $DRY_RUN && return 0
+  printf '%s\n' '{"schema":1,"current":null,"previous":null,"applied":{},"pending_maintenance":[],"history":[]}' >"$STATE_FILE"
+}
+
+# state_get <jq filter> [jq args...]: prints the value (raw).
+state_get() {
+  [[ -f $STATE_FILE ]] || return 0
+  jq -r "$@" "$STATE_FILE"
+}
+
+# state_set <jq filter> [jq args...]: rewrites state.json atomically.
+state_set() {
+  if $DRY_RUN; then
+    log "[dry-run] state.json: $1"
+    return 0
+  fi
+  state_init
+  local tmp=$STATE_FILE.tmp
+  jq "$@" "$STATE_FILE" >"$tmp"
+  mv "$tmp" "$STATE_FILE"
+}
+
+installed() {
+  [[ -f $STATE_FILE ]] && [[ -n $(state_get '.current.backend_tag // empty') ]]
+}
+
+cutover_done() { [[ -n $(state_get '.cutover_utc // empty') ]]; }
+
+# ---------------------------------------------------------------------------
+# Lock
+
+take_lock() {
+  if [[ ${RADIOCTL_LOCK_HELD:-} == 1 ]]; then
+    return 0
+  fi
+  exec 9>>"$LOCK_FILE"
+  if flock -n 9; then
+    export RADIOCTL_LOCK_HELD=1
+    return 0
+  fi
+  if ((LOCK_WAIT > 0)); then
+    say "Another radioctl (an update or the backup) is running; waiting up to ${LOCK_WAIT}s."
+    if flock -w "$LOCK_WAIT" 9; then
+      export RADIOCTL_LOCK_HELD=1
+      return 0
+    fi
+  fi
+  die "another radioctl is running (state.lock); try again later"
+}
+
+# ---------------------------------------------------------------------------
+# Versions
+
+is_semver() { [[ $1 =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; }
+
+# ver_cmp <a> <b>: prints -1, 0, or 1.
+ver_cmp() {
+  local -a a b
+  local i
+  IFS=. read -r -a a <<<"$1"
+  IFS=. read -r -a b <<<"$2"
+  for i in 0 1 2; do
+    if ((a[i] < b[i])); then
+      echo -1
+      return
+    elif ((a[i] > b[i])); then
+      echo 1
+      return
+    fi
+  done
+  echo 0
+}
+ver_lt() { [[ $(ver_cmp "$1" "$2") == -1 ]]; }
+ver_gt() { [[ $(ver_cmp "$1" "$2") == 1 ]]; }
+major_minor() { printf '%s' "${1%.*}"; }
+
+release_label() {
+  if [[ $1 == "$2" ]]; then
+    printf '%s' "$1"
+  else
+    printf 'backend %s, frontend %s' "$1" "$2"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Docker and Compose
+
+COMPOSE=()
+# compose_args <app env file>
+compose_args() {
+  COMPOSE=(compose --project-directory "$ROOT" -f "$ROOT/docker-compose.yml")
+  [[ -n $COMPOSE_OVERRIDE ]] && COMPOSE+=(-f "$COMPOSE_OVERRIDE")
+  COMPOSE+=(--env-file "$ENV_FILE" --env-file "$1" --env-file "$NETWORK_ENV")
+  if monitoring_enabled; then
+    COMPOSE+=(--profile monitoring)
+  fi
+  return 0
+}
+
+# dc: compose with the running release (runtime/applied.env).
+dc() {
+  compose_args "$APPLIED_ENV"
+  docker "${COMPOSE[@]}" "$@"
+}
+
+# dct: compose with the target release (runtime/target.env).
+dct() {
+  compose_args "$TARGET_ENV"
+  docker "${COMPOSE[@]}" "$@"
+}
+
+db_sql() {
+  dc exec -T db psql -U "$(envv POSTGRES_USER)" -d "$(envv POSTGRES_DB)" -v ON_ERROR_STOP=1 -tAc "$1" 2>&5
+}
+
+# api_get <path>: the body of GET <path> on the backend, through its own
+# curl (the backend publishes no port).
+api_get() {
+  dc exec -T backend curl -fsS --max-time 5 "$API$1" 2>&5
+}
+
+# api_patch_settings <json values object>
+api_patch_settings() {
+  jq -c '{values: .}' <<<"$1" |
+    dc exec -T backend curl -fsS --max-time 15 -X PATCH -H 'Content-Type: application/json' \
+      --data-binary @- "$API/api/settings" >&5 2>&5
+}
+
+# setting <key>: the value of a backend setting (JSON-encoded if not a string).
+setting() {
+  local body
+  body=$(api_get /api/settings) || return 1
+  jq -r --arg k "$1" '.items[] | select(.key == $k) | .value | if type == "string" then . else tojson end' <<<"$body"
+}
+
+container_status() {
+  local cid
+  cid=$(dc ps -q "$1" 2>&5) || return 1
+  [[ -n $cid ]] || return 1
+  docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$cid" 2>&5
+}
+
+# wait_healthy <service> <seconds>
+wait_healthy() {
+  $DRY_RUN && return 0
+  local deadline st
+  deadline=$(($(now) + $2))
+  while :; do
+    st=$(container_status "$1") || st=missing
+    log "$1: $st"
+    [[ $st == healthy ]] && return 0
+    (($(now) >= deadline)) && return 1
+    sleep_s 3
+  done
+}
+
+# health_gate [ready]: /readyz answers, and after the cut-over the control
+# link is connected with items queued (plan 7.3 step 10).
+health_gate() {
+  if $DRY_RUN; then
+    say "    [dry-run] health gate (${HEALTH_TIMEOUT}s)"
+    return 0
+  fi
+  local mode=${1:-full} deadline body
+  deadline=$(($(now) + HEALTH_TIMEOUT))
+  while :; do
+    if api_get /readyz >/dev/null; then
+      if [[ $mode == ready ]] || ! cutover_done; then
+        return 0
+      fi
+      if body=$(api_get /api/playout/status) &&
+        jq -e '.control_link.connected == true and ((.queued // []) | length) > 0' <<<"$body" >/dev/null; then
+        return 0
+      fi
+    fi
+    if (($(now) >= deadline)); then
+      log "health gate: timeout after ${HEALTH_TIMEOUT}s"
+      return 1
+    fi
+    sleep_s 3
+  done
+}
+
+image_info() {
+  docker image inspect --format '{{.Id}} {{.Os}}/{{.Architecture}}' "$1" 2>&5 || true
+}
+
+# resolve_digest <repository> <tag>: the manifest list digest of the tag.
+resolve_digest() {
+  local ref=$1:$2 out line
+  if docker buildx version >/dev/null 2>&1; then
+    out=$(docker buildx imagetools inspect --format '{{json .Manifest}}' "$ref" 2>&5) || return 1
+    jq -r '.digest // empty' <<<"$out"
+    return 0
+  fi
+  # Without buildx: pull by tag (restarts nothing) and read the digest the
+  # registry gave.
+  logrun docker pull -q "$ref" || return 1
+  while IFS= read -r line; do
+    if [[ $line == "$1@"* ]]; then
+      printf '%s\n' "${line#*@}"
+      return 0
+    fi
+  done < <(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$ref" 2>&5)
+  return 1
+}
+
+registry_login() {
+  [[ $BACKEND_IMAGE == ghcr.io/* ]] || return 0
+  if $DRY_RUN; then
+    say "    [dry-run] docker login ghcr.io"
+    return 0
+  fi
+  log "+ docker login ghcr.io -u <GHCR_USER> --password-stdin"
+  printf '%s' "$(envv GHCR_READ_TOKEN)" |
+    docker login ghcr.io -u "$(envv GHCR_USER)" --password-stdin >&5 2>&5 ||
+    die "registry login failed (GHCR_USER, GHCR_READ_TOKEN in .env)"
+  local cfg=${DOCKER_CONFIG:-$HOME/.docker}/config.json
+  [[ -f $cfg ]] && chmod 600 "$cfg"
+  return 0
+}
+
+sha256() {
+  if command -v sha256sum >/dev/null; then
+    sha256sum | cut -c1-64
+  else
+    shasum -a 256 | cut -c1-64
+  fi
+}
+
+# config_hash <dir under config/>: SHA-256 over the file names and contents.
+config_hash() {
+  (
+    cd "$ROOT"
+    find "config/$1" -type f -print0 | LC_ALL=C sort -z | xargs -0 -r cat -- | sha256
+    find "config/$1" -type f | LC_ALL=C sort | sha256
+  ) | sha256
+}
+
+# ---------------------------------------------------------------------------
+# Preflight (plan 7.3 step 1)
+
+# pinned_version <apt version>: 5:28.1.1-1~ubuntu.24.04~noble -> 28.1.1
+pinned_version() {
+  local v=${1#*:}
+  printf '%s' "${v%%-*}"
+}
+
+preflight_docker() {
+  docker info >/dev/null 2>&5 || die "Docker does not answer in this distribution; run install.bat"
+  declare -A PINS=()
+  [[ -f $ROOT/install/versions.env ]] && read_kv "$ROOT/install/versions.env" PINS
+  local want have
+  want=$(pinned_version "${PINS[DOCKER_CE_VERSION]:-}")
+  if [[ -z $want ]]; then
+    log "install/versions.env pins no Docker Engine version yet (D4); not checked"
+  else
+    have=$(docker version --format '{{.Server.Version}}' 2>&5) || have=unknown
+    [[ $have == "$want" ]] || die "Docker Engine is $have, install/versions.env pins $want; run install.bat"
+  fi
+  want=$(pinned_version "${PINS[DOCKER_COMPOSE_PLUGIN_VERSION]:-}")
+  if [[ -z $want ]]; then
+    log "install/versions.env pins no Compose version yet (D4); not checked"
+  else
+    have=$(docker compose version --short 2>&5) || have=unknown
+    have=${have#v}
+    [[ $have == "$want" ]] || die "Docker Compose is $have, install/versions.env pins $want; run install.bat"
+  fi
+}
+
+preflight() {
+  step "Preflight"
+  preflight_docker
+  load_env || die ".env is missing: run 'radioctl first-run' (update.bat does it on a new machine)"
+  check_env_vars
+  [[ -f $NETWORK_ENV ]] || die "runtime/network.env is missing; radio-network.service writes it at boot (install.bat)"
+}
+
+# ---------------------------------------------------------------------------
+# Fetch this repository (plan 7.3 step 2)
+
+fetch_repo() {
+  if $NO_FETCH || [[ ${RADIOCTL_REEXEC:-} == 1 ]]; then
+    log "repository fetch skipped"
+    return 0
+  fi
+  step "Fetching the deploy repository"
+  if [[ ! -d $ROOT/.git ]]; then
+    warn "$ROOT is not a Git checkout; not fetched"
+    return 0
+  fi
+  local before after self_before self_after
+  before=$(git -C "$ROOT" rev-parse HEAD 2>&5)
+  self_before=$(sha256 <"$SELF")
+  if $DRY_RUN; then
+    logrun git -C "$ROOT" fetch -q || warn "git fetch failed"
+    say "    [dry-run] git pull --ff-only; incoming: $(git -C "$ROOT" log --oneline "HEAD..@{u}" 2>/dev/null | wc -l) commit(s)"
+    return 0
+  fi
+  logrun git -C "$ROOT" pull --ff-only || die "git pull --ff-only failed (local changes in $ROOT?); see $LOG_REL"
+  after=$(git -C "$ROOT" rev-parse HEAD 2>&5)
+  if [[ $before == "$after" ]]; then
+    say "    no changes"
+    return 0
+  fi
+  git -C "$ROOT" log --oneline "$before..$after" 2>&5 | sed 's/^/    /' >&3
+  self_after=$(sha256 <"$SELF")
+  if [[ $self_before != "$self_after" ]]; then
+    say "    bin/radioctl changed; running the new version"
+    exec 5>&-
+    RADIOCTL_REEXEC=1 exec "$SELF" "${ORIG_ARGS[@]}"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Database facts (psql inside db)
+
+DB_DIRTY=f
+DB_SCHEMA_VERSION=0
+DB_MIN_APP=1.0.0
+
+read_db_state() {
+  local out
+  out=$(db_sql "SELECT to_regclass('public.schema_migrations') IS NOT NULL") || die "cannot read the database (db); see $LOG_REL"
+  if [[ $out == t ]]; then
+    out=$(db_sql "SELECT version || ' ' || dirty FROM schema_migrations LIMIT 1") || die "cannot read schema_migrations; see $LOG_REL"
+    if [[ -n $out ]]; then
+      DB_SCHEMA_VERSION=${out%% *}
+      DB_DIRTY=${out##* }
+    fi
+  fi
+  DB_MIN_APP=$(read_min_app) || die "cannot read schema_compat; see $LOG_REL"
+  log "database: schema_version=$DB_SCHEMA_VERSION dirty=$DB_DIRTY min_app_version=$DB_MIN_APP"
+}
+
+# read_min_app: schema_compat.min_app_version; no table means 1.0.0 (§10.4).
+read_min_app() {
+  local out
+  out=$(db_sql "SELECT to_regclass('public.schema_compat') IS NOT NULL") || return 1
+  if [[ $out != t ]]; then
+    echo 1.0.0
+    return 0
+  fi
+  out=$(db_sql "SELECT min_app_version FROM schema_compat WHERE id = 1") || return 1
+  echo "${out:-1.0.0}"
+}
+
+# ---------------------------------------------------------------------------
+# Dumps (the mandatory pre-update dump and the restore; D6 adds the daily
+# backup, the journal copy, the Windows copy, and their retention)
+
+# take_dump: pg_dump -Fc into BACKUP_ROOT/update/db-<UTC>.dump; sets DUMP.
+DUMP=
+take_dump() {
+  local dir name
+  dir=$(envv BACKUP_ROOT)/update
+  name=db-$(utc_stamp)
+  DUMP=$dir/$name.dump
+  local i=1
+  while [[ -e $DUMP ]]; do
+    DUMP=$dir/$name-$i.dump
+    i=$((i + 1))
+  done
+  if $DRY_RUN; then
+    say "    [dry-run] pg_dump -Fc > $DUMP"
+    return 0
+  fi
+  mkdir -p "$dir"
+  log "+ pg_dump -Fc > $DUMP"
+  if ! dc exec -T db pg_dump -U "$(envv POSTGRES_USER)" -d "$(envv POSTGRES_DB)" -Fc >"$DUMP.part" 2>&5 ||
+    [[ ! -s $DUMP.part ]]; then
+    rm -f "$DUMP.part"
+    return 1
+  fi
+  mv "$DUMP.part" "$DUMP"
+  backup_extras "$DUMP"
+  state_set '.last_dump = $d' --arg d "$DUMP"
+}
+
+# backup_extras <dump>: D6 boundary. The journal copy and the copy to
+# BACKUP_WINDOWS_COPY belong to `radioctl backup` (D6 tasks 1 and 3).
+backup_extras() {
+  log "journal copy and Windows copy of $1: Phase D6, not done by this version"
+}
+
+# pg_restore_dump <dump>: replaces the database with the dump, in one
+# transaction (a failure leaves it unchanged). backend must be stopped.
+pg_restore_dump() {
+  if $DRY_RUN; then
+    say "    [dry-run] pg_restore --clean --if-exists --single-transaction < $1"
+    return 0
+  fi
+  log "+ pg_restore --clean --if-exists --single-transaction < $1"
+  dc exec -T db pg_restore -U "$(envv POSTGRES_USER)" -d "$(envv POSTGRES_DB)" \
+    --clean --if-exists --single-transaction --no-owner <"$1" >&5 2>&5
+}
+
+dump_time() {
+  local b
+  b=$(basename "$1")
+  if [[ $b =~ ([0-9]{4}-[0-9]{2}-[0-9]{2})T([0-9]{2})([0-9]{2})([0-9]{2})Z ]]; then
+    printf '%sT%s:%s:%sZ' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}"
+  else
+    printf 'unknown time'
+  fi
+}
+
+# retain_update_dumps: keeps the newest BACKUP_UPDATE_KEEP update dumps,
+# the recorded last_dump, and the dumps of the last BACKUP_BOUNDARY_KEEP
+# history entries with boundary: true (plan D6 task 3, §10.4).
+retain_update_dumps() {
+  local dir keep bkeep f n=0
+  dir=$(envv BACKUP_ROOT)/update
+  [[ -d $dir ]] || return 0
+  keep=$(envv BACKUP_UPDATE_KEEP 14)
+  bkeep=$(envv BACKUP_BOUNDARY_KEEP 3)
+  declare -A protected=()
+  protected[$(state_get '.last_dump // ""')]=1
+  while IFS= read -r f; do
+    [[ -n $f ]] && protected[$f]=1
+  done < <(state_get --argjson k "$bkeep" '[.history[] | select(.boundary == true and .dump != null)] | .[-$k:] | .[].dump' 2>/dev/null || true)
+  while IFS= read -r f; do
+    n=$((n + 1))
+    ((n <= keep)) && continue
+    [[ -n ${protected[$f]:-} ]] && continue
+    say "    retention: removing $(basename "$f")"
+    mut rm -f -- "$f"
+  done < <(find "$dir" -maxdepth 1 -type f -name 'db-*.dump' | LC_ALL=C sort -r)
+}
+
+# ---------------------------------------------------------------------------
+# Air check (plan 7.3 step 4)
+
+PREPUSH=5
+STATION_TZ=UTC
+
+read_window_settings() {
+  local v
+  if v=$(setting playout.prepush_minutes) && [[ $v =~ ^[0-9]+$ ]]; then
+    PREPUSH=$v
+  else
+    warn "playout.prepush_minutes could not be read; using $PREPUSH"
+  fi
+  if v=$(setting station.timezone) && [[ -n $v ]]; then
+    STATION_TZ=$v
+  fi
+}
+
+# window_wait: not within prepush + 1 minute before a station hour, nor in
+# the first minute after it.
+window_wait() {
+  local t m s into wait
+  while :; do
+    t=$(now)
+    read -r m s < <(fmt_time "$STATION_TZ" '%M %S' "$t")
+    into=$((10#$m * 60 + 10#$s))
+    if ((3600 - into <= (PREPUSH + 1) * 60)); then
+      wait=$((3600 - into + 60))
+    elif ((into < 60)); then
+      wait=$((60 - into))
+    else
+      return 0
+    fi
+    if $NO_WAIT; then
+      say "The next hour's items are being pushed (within ${PREPUSH}+1 minutes of the hour); stopped (--no-wait)."
+      return 1
+    fi
+    say "    waiting ${wait}s: the next hour's items are being pushed"
+    sleep_s "$wait"
+  done
+}
+
+air_check() {
+  if ! cutover_done; then
+    say "    before the cut-over: air check skipped"
+    return 0
+  fi
+  step "Air check"
+  local body st on_air deadline
+  if body=$(api_get /api/broadcast/status); then
+    st=$(jq -r '.state' <<<"$body")
+    log "broadcast state: $st"
+    if [[ $st == unreachable ]]; then
+      say "An outage is open (the stream server is unreachable): the update is stopped. Nothing was changed."
+      return 1
+    fi
+  else
+    confirm "The broadcast status could not be read. Continue anyway?" || return 1
+  fi
+  if body=$(api_get /api/status/live); then
+    on_air=$(jq -r '.on_air' <<<"$body")
+    log "live on_air: $on_air"
+    if [[ $on_air != false ]]; then
+      confirm "Live voice may be on air (on_air: $on_air); it will drop during the update. Continue?" || return 1
+    fi
+  else
+    confirm "The live voice status could not be read. Continue anyway?" || return 1
+  fi
+  deadline=$(($(now) + 120))
+  while :; do
+    if ! body=$(api_get /api/playout/status); then
+      confirm "The playout status could not be read. Continue anyway?" || return 1
+      break
+    fi
+    if jq -e '.control_link.connected == true and ((.queued // []) | length) >= 2' <<<"$body" >/dev/null; then
+      break
+    fi
+    log "playout: $(jq -c '{connected: .control_link.connected, queued: ((.queued // []) | length)}' <<<"$body")"
+    if (($(now) >= deadline)); then
+      say "Liquidsoap has fewer than 2 items queued or no control link after 2 minutes: the update is stopped. Nothing was changed."
+      return 1
+    fi
+    say "    waiting: fewer than 2 items queued in Liquidsoap"
+    sleep_s 10
+  done
+  read_window_settings
+  window_wait
+}
+
+# ---------------------------------------------------------------------------
+# Prompts
+
+confirm() {
+  if $YES; then
+    say "$1 yes (--yes)"
+    return 0
+  fi
+  if $DRY_RUN; then
+    say "    [dry-run] would ask: $1"
+    return 0
+  fi
+  local ans=
+  printf '%s [y/N] ' "$1" >&3
+  IFS= read -r ans || ans=
+  log "$1 -> $ans"
+  [[ $ans =~ ^[Yy]([Ee][Ss])?$ ]]
+}
+
+# typed <word> <text>: the destructive confirmation; --yes does not answer it.
+typed() {
+  if $DRY_RUN; then
+    say "    [dry-run] would ask to type $1"
+    return 0
+  fi
+  local ans=
+  printf '%s\nType %s to continue: ' "$2" "$1" >&3
+  IFS= read -r ans || ans=
+  log "typed confirmation $1: $([[ $ans == "$1" ]] && echo given || echo refused)"
+  [[ $ans == "$1" ]]
+}
+
+# ---------------------------------------------------------------------------
+# Liquidsoap and db: applied values and pending maintenance (plan 7.3 step 13)
+
+# infra_now: the JSON of the liquidsoap and db values this repository
+# would apply now.
+infra_now() {
+  local cfg contract
+  cfg=$(dc config --format json 2>&5) || return 1
+  contract=$(script_contract "$SCRIPT_FILE" || echo 0)
+  jq -n --argjson cfg "$cfg" \
+    --arg script "$(sha256 <"$SCRIPT_FILE")" \
+    --argjson contract "$contract" \
+    --arg ldef "$(jq -cS '.services.liquidsoap' <<<"$cfg" | sha256)" \
+    --arg ddef "$(jq -cS '.services.db' <<<"$cfg" | sha256)" \
+    '{liquidsoap_image: $cfg.services.liquidsoap.image, liquidsoap_script_sha256: $script,
+      liquidsoap_contract: $contract, liquidsoap_definition_sha256: $ldef,
+      db_image: $cfg.services.db.image, db_definition_sha256: $ddef}'
+}
+
+# pending_list <infra_now json>: one line per difference to state.applied.
+pending_list() {
+  jq -r --argjson now "$1" '
+    .applied as $a |
+    (if ($a.liquidsoap_image // null) != $now.liquidsoap_image then "liquidsoap image \($a.liquidsoap_image // "unknown") -> \($now.liquidsoap_image)" else empty end),
+    (if ($a.liquidsoap_contract // null) != $now.liquidsoap_contract then "liquidsoap script contract \($a.liquidsoap_contract // "unknown") -> \($now.liquidsoap_contract)"
+     elif ($a.liquidsoap_script_sha256 // null) != $now.liquidsoap_script_sha256 then "liquidsoap script config/liquidsoap/radio.liq changed" else empty end),
+    (if ($a.liquidsoap_definition_sha256 // null) != $now.liquidsoap_definition_sha256 and ($a.liquidsoap_image // null) == $now.liquidsoap_image then "liquidsoap service definition changed" else empty end),
+    (if ($a.db_image // null) != $now.db_image then "db image \($a.db_image // "unknown") -> \($now.db_image)" else empty end),
+    (if ($a.db_definition_sha256 // null) != $now.db_definition_sha256 and ($a.db_image // null) == $now.db_image then "db service definition changed" else empty end)
+  ' "$STATE_FILE"
+}
+
+report_pending() {
+  step "Pending maintenance"
+  local infra list
+  if ! infra=$(infra_now); then
+    warn "could not render the compose file to compare liquidsoap and db"
+    return 0
+  fi
+  if [[ -z $(state_get '.applied.liquidsoap_image // empty') ]]; then
+    warn "no applied liquidsoap/db record in state.json; recording the current values as applied"
+    state_set '.applied += $n' --argjson n "$infra"
+    return 0
+  fi
+  list=$(pending_list "$infra")
+  if [[ -z $list ]]; then
+    say "    none"
+  else
+    while IFS= read -r l; do
+      say "    pending: $l"
+    done <<<"$list"
+    say "    Liquidsoap and db were not restarted. Run 'update.bat maintenance' in a maintenance window."
+  fi
+  state_set '.pending_maintenance = ($l | split("\n") | map(select(. != "")))' --arg l "$list"
+}
+
+# ---------------------------------------------------------------------------
+# Loki, Alloy, Grafana (plan 7.3 step 12; failures are warnings)
+
+CONFIG_HASHES='{}'
+
+apply_monitoring() {
+  step "Loki, Alloy, Grafana"
+  local svc dir h old force
+  CONFIG_HASHES=$(jq -n --arg l "$(config_hash loki)" --arg a "$(config_hash alloy)" --arg g "$(config_hash grafana)" \
+    '{loki: $l, alloy: $a, grafana: $g}')
+  for svc in loki alloy; do
+    dir=$svc
+    h=$(jq -r --arg s "$dir" '.[$s]' <<<"$CONFIG_HASHES")
+    old=$(state_get --arg s "$dir" '.applied.config_sha256[$s] // empty')
+    force=()
+    if [[ -n $old && $old != "$h" ]]; then
+      say "    $svc: configuration changed; recreating"
+      force=(--force-recreate)
+    fi
+    mut dc up -d --no-deps "${force[@]}" "$svc" || warn "monitoring: failed ($svc); see $LOG_REL"
+  done
+  if monitoring_enabled; then
+    h=$(jq -r '.grafana' <<<"$CONFIG_HASHES")
+    old=$(state_get '.applied.config_sha256.grafana // empty')
+    force=()
+    [[ -n $old && $old != "$h" ]] && force=(--force-recreate)
+    if mut dc run --rm --no-deps -T grafana-role; then
+      mut dc up -d --no-deps --wait "${force[@]}" grafana || warn "monitoring: failed (grafana); see $LOG_REL"
+    else
+      warn "monitoring: failed (grafana-role); see $LOG_REL"
+    fi
+  else
+    local cid
+    cid=$(docker ps -q --filter "label=com.docker.compose.project=$PROJECT" \
+      --filter label=com.docker.compose.service=grafana 2>&5 || true)
+    if [[ -n $cid ]]; then
+      mut docker stop "$cid" || warn "monitoring: could not stop grafana"
+    fi
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Install of a release (plan 7.3, 7.4, §10.4)
+
+# Target and running release.
+T_BTAG='' T_BDIG='' T_FTAG='' T_FDIG=''
+C_BTAG='' C_BDIG='' C_FTAG='' C_FDIG=''
+KIND=update
+TARGET_LABEL='' CURRENT_LABEL=''
+DIRECTION=newer
+RESTORE_DUMP='' RESTORE_FROM=''
+
+load_current() {
+  C_BTAG=$(state_get '.current.backend_tag // empty')
+  C_BDIG=$(state_get '.current.backend_digest // empty')
+  C_FTAG=$(state_get '.current.frontend_tag // empty')
+  C_FDIG=$(state_get '.current.frontend_digest // empty')
+  CURRENT_LABEL=$(release_label "$C_BTAG" "$C_FTAG")
+}
+
+# history_add <result> [restored] [min_app_after]
+history_add() {
+  local restored=${2:-false} after=${3:-$DB_MIN_APP}
+  local boundary=false
+  [[ $1 == ok ]] && ver_gt "$after" "$DB_MIN_APP" && boundary=true
+  state_set '.history += [{utc: $utc, kind: $kind, from: $from, to: $to,
+      from_frontend: $ff, to_frontend: $tf, result: $res,
+      dump: (if $dump == "" then null else $dump end),
+      schema_version_before: ($sv | tonumber), min_app_version_before: $before,
+      min_app_version_after: $after, boundary: $boundary, restored: $restored, log: $log}]' \
+    --arg utc "$(utc_now)" --arg kind "$KIND" --arg from "$C_BTAG" --arg to "$T_BTAG" \
+    --arg ff "$C_FTAG" --arg tf "$T_FTAG" --arg res "$1" --arg dump "$DUMP" \
+    --arg sv "$DB_SCHEMA_VERSION" --arg before "$DB_MIN_APP" --arg after "$after" \
+    --argjson boundary "$boundary" --argjson restored "$restored" --arg log "$LOG_REL"
+}
+
+# undone <result> [restored] [note]: the plain message of every failure
+# path (plan 7.3 steps 7 and 14); records it and exits 1.
+undone() {
+  history_add "$1" "${2:-false}"
+  state_set '.last_result = "failed" | del(.target)'
+  say ""
+  if [[ -n ${3:-} ]]; then
+    say "Update to $TARGET_LABEL failed and $3. Send the log $LOG_REL to the developer."
+  else
+    say "Update to $TARGET_LABEL failed and was undone. Broadcasting continues on $CURRENT_LABEL. Send the log $LOG_REL to the developer."
+  fi
+  say "(full path: $LOG_FILE)"
+  exit 1
+}
+
+# refuse <text>: a stop before any change.
+refuse() {
+  say ""
+  say "$1"
+  say "Nothing was changed. Log: $LOG_REL"
+  state_set 'del(.target)'
+  exit 1
+}
+
+release_check() {
+  step "Release check: $TARGET_LABEL"
+  local t min_backend d
+  for t in "$T_BTAG" "$T_FTAG"; do
+    is_semver "$t" || refuse "Refused: '$t' is not a release tag (X.Y.Z)."
+    ver_lt "$t" 1.0.0 && refuse "Refused: $t is below 1.0.0; no release below 1.0.0 is installed."
+  done
+  [[ $(major_minor "$T_BTAG") == "$(major_minor "$T_FTAG")" ]] ||
+    refuse "Refused: backend $T_BTAG and frontend $T_FTAG differ in MAJOR.MINOR (11.7)."
+  min_backend=$(script_min_backend "$SCRIPT_FILE") || refuse "Refused: config/liquidsoap/radio.liq has no min-backend header."
+  ver_lt "$T_BTAG" "$min_backend" &&
+    refuse "Refused: backend $T_BTAG is below $min_backend, the min-backend of config/liquidsoap/radio.liq."
+  registry_login
+  d=$(resolve_digest "$BACKEND_IMAGE" "$T_BTAG") && [[ -n $d ]] ||
+    refuse "Refused: the image $BACKEND_IMAGE:$T_BTAG was not found in the registry."
+  if [[ -z $T_BDIG ]]; then
+    T_BDIG=$d
+  elif [[ $d != "$T_BDIG" ]]; then
+    refuse "Refused: $BACKEND_IMAGE:$T_BTAG is $d in the registry, not $T_BDIG."
+  fi
+  d=$(resolve_digest "$FRONTEND_IMAGE" "$T_FTAG") && [[ -n $d ]] ||
+    refuse "Refused: the image $FRONTEND_IMAGE:$T_FTAG was not found in the registry."
+  if [[ -z $T_FDIG ]]; then
+    T_FDIG=$d
+  elif [[ $d != "$T_FDIG" ]]; then
+    refuse "Refused: $FRONTEND_IMAGE:$T_FTAG is $d in the registry, not $T_FDIG."
+  fi
+  say "    backend  $T_BTAG $T_BDIG"
+  say "    frontend $T_FTAG $T_FDIG"
+
+  read_db_state
+  if [[ $DB_DIRTY == t ]]; then
+    undone failed false "was not started: the database is dirty (schema version $DB_SCHEMA_VERSION). Broadcasting continues on $CURRENT_LABEL"
+  fi
+  case $(ver_cmp "$T_BTAG" "$C_BTAG") in
+    1) DIRECTION=newer ;;
+    -1) DIRECTION=older ;;
+    0) DIRECTION=same ;;
+  esac
+  log "direction: $DIRECTION (running $C_BTAG, target $T_BTAG)"
+  if [[ $DIRECTION == older ]] && ver_lt "$T_BTAG" "$DB_MIN_APP"; then
+    offer_boundary_restore
+  fi
+}
+
+# offer_boundary_restore: the target is below min_app_version (§10.4).
+offer_boundary_restore() {
+  say ""
+  say "Refused: the database needs at least release $DB_MIN_APP (a contract migration raised it); $T_BTAG is older."
+  local entries line dump utc from
+  entries=$(state_get --arg t "$T_BTAG" '
+    def v: split(".") | map(tonumber);
+    [.history[] | select(.dump != null and .min_app_version_before != null
+       and (.min_app_version_before | v) <= ($t | v))] | reverse | .[] | [.dump, .utc, .from] | @tsv')
+  local -a cands=()
+  while IFS=$'\t' read -r dump utc from; do
+    [[ -n $dump && -f $dump ]] && cands+=("$dump"$'\t'"$utc"$'\t'"$from")
+  done <<<"$entries"
+  if ((${#cands[@]} == 0)); then
+    refuse "No dump taken while the database still accepted $T_BTAG is available."
+  fi
+  say "Restore points (pre-update dumps taken while the database accepted $T_BTAG), newest first:"
+  for line in "${cands[@]}"; do
+    IFS=$'\t' read -r dump utc from <<<"$line"
+    say "    $(basename "$dump")  taken $(dump_time "$dump") before the update from $from"
+  done
+  IFS=$'\t' read -r dump utc from <<<"${cands[0]}"
+  say "Restoring $(basename "$dump") loses every change since $(dump_time "$dump"): the plan, the play log, settings, and library edits."
+  if ! typed RESTORE "To restore it and then install $TARGET_LABEL,"; then
+    refuse "Not confirmed."
+  fi
+  RESTORE_DUMP=$dump
+  RESTORE_FROM=$from
+  KIND=restore-install
+}
+
+record_target() {
+  local bi fimg
+  bi=$(image_info "$BACKEND_IMAGE:$T_BTAG@$T_BDIG")
+  fimg=$(image_info "$FRONTEND_IMAGE:$T_FTAG@$T_FDIG")
+  state_set '.target = {backend_tag: $bt, backend_digest: $bd, frontend_tag: $ft, frontend_digest: $fd,
+      backend_image_id: ($bi | split(" ")[0]), frontend_image_id: ($fimg | split(" ")[0]),
+      platform: ($bi | split(" ")[1] // null)} | .last_result = "pending"' \
+    --arg bt "$T_BTAG" --arg bd "$T_BDIG" --arg ft "$T_FTAG" --arg fd "$T_FDIG" --arg bi "$bi" --arg fimg "$fimg"
+}
+
+# migrate_step: plan 7.3 step 7 (newer targets only).
+migrate_step() {
+  step "Migrating the database (the running backend keeps serving)"
+  local tc rc=0 stopped=false
+  if $DRY_RUN; then
+    say "    [dry-run] migrate target-compat; migrate up"
+    return 0
+  fi
+  if ! tc=$(dct run --rm --no-deps -T migrate migrate target-compat 2>&5) || ! is_semver "${tc//[[:space:]]/}"; then
+    undone failed
+  fi
+  tc=${tc//[[:space:]]/}
+  log "target min_app_version (target-compat): $tc"
+  if ver_lt "$C_BTAG" "$tc"; then
+    say "    $C_BTAG cannot run on the migrated schema (needs $tc): stopping the backend first"
+    logrun dc stop backend || undone failed
+    stopped=true
+  fi
+  logrun dct run --rm --no-deps -T migrate || rc=$?
+  log "migrate up exit code: $rc"
+  case $rc in
+    0)
+      DB_MIN_APP_AFTER=$(read_min_app) || DB_MIN_APP_AFTER=$DB_MIN_APP
+      return 0
+      ;;
+    5)
+      say "    the migration left the database dirty: restoring the pre-update dump"
+      auto_restore
+      ;;
+    *)
+      if ((rc == 4)); then
+        say "    the migration failed and was rolled back; the schema is unchanged"
+      else
+        say "    the migration did not run (exit $rc); the database was not changed"
+      fi
+      if $stopped; then
+        start_old_backend || undone failed false "was undone, but the backend did not pass its health check. Broadcasting may continue from the Liquidsoap queue only"
+      fi
+      undone rolled_back
+      ;;
+  esac
+}
+
+start_old_backend() {
+  logrun dc up -d --no-deps backend || return 1
+  health_gate
+}
+
+# auto_restore: exit 5 (plan 7.3 step 7): restore this run's dump without a
+# prompt, start the old backend.
+auto_restore() {
+  local ok=true
+  logrun dc stop backend || true
+  pg_restore_dump "$DUMP" || ok=false
+  if start_old_backend; then
+    if $ok; then
+      undone rolled_back true
+    fi
+    undone failed false "the database could not be restored automatically; the developer must check it. Broadcasting continues on $CURRENT_LABEL"
+  fi
+  if $ok; then
+    undone failed true "was undone, but $CURRENT_LABEL did not pass its health check after the restore; the developer must check it"
+  fi
+  undone failed false "the database could not be restored automatically, and $CURRENT_LABEL did not pass its health check; the developer must check it"
+}
+
+# restore_for_downgrade: the typed-RESTORE path of §10.4.
+restore_for_downgrade() {
+  step "Restoring $(basename "$RESTORE_DUMP") for $TARGET_LABEL"
+  mut dc stop backend || true
+  if ! pg_restore_dump "$RESTORE_DUMP"; then
+    start_old_backend || true
+    undone failed false "the database could not be restored; it is unchanged. Broadcasting continues on $CURRENT_LABEL"
+  fi
+  DB_MIN_APP_AFTER=$(read_min_app 2>/dev/null || echo "$DB_MIN_APP")
+  if [[ -n $RESTORE_FROM ]] && ver_gt "$T_BTAG" "$RESTORE_FROM"; then
+    say "    the dump is from $RESTORE_FROM: migrating to $T_BTAG"
+    local rc=0
+    mut dct run --rm --no-deps -T migrate || rc=$?
+    ((rc == 0)) || undone failed true "after the restore of $(basename "$RESTORE_DUMP") (migrate exit $rc); the developer must check it. The backend is stopped"
+  fi
+}
+
+# rollback_app: plan 7.3 step 14.
+rollback_app() {
+  say "    $1: rolling back to $CURRENT_LABEL"
+  if [[ -n $RESTORE_DUMP ]]; then
+    undone failed true "after the restore of $(basename "$RESTORE_DUMP"); the previous release cannot run on the restored database. The developer must check it"
+  fi
+  write_app_env "$APPLIED_ENV" "$C_BTAG" "$C_BDIG" "$C_FTAG" "$C_FDIG"
+  logrun dc up -d --no-deps backend frontend || true
+  if health_gate; then
+    undone rolled_back
+  fi
+  undone failed false "was rolled back to $CURRENT_LABEL, which did not pass its health check either; the developer must check it"
+}
+
+DB_MIN_APP_AFTER=
+
+install_release() {
+  load_current
+  TARGET_LABEL=$(release_label "$T_BTAG" "$T_FTAG")
+  release_check
+  DB_MIN_APP_AFTER=$DB_MIN_APP
+
+  if [[ $DIRECTION == same && $T_BDIG == "$C_BDIG" && $T_FTAG == "$C_FTAG" && $T_FDIG == "$C_FDIG" && -z $RESTORE_DUMP ]]; then
+    say "Release $TARGET_LABEL is already running."
+    apply_monitoring
+    report_pending
+    state_set '.applied.config_sha256 = $h' --argjson h "$CONFIG_HASHES"
+    say "Done."
+    return 0
+  fi
+
+  air_check || refuse "Update to $TARGET_LABEL not started."
+
+  step "Pulling images"
+  write_app_env "$TARGET_ENV" "$T_BTAG" "$T_BDIG" "$T_FTAG" "$T_FDIG"
+  mut dct pull -q || refuse "Pulling the images failed; see $LOG_REL."
+  record_target
+
+  step "Database dump (mandatory)"
+  take_dump || refuse "The database dump failed; the update is stopped."
+  say "    $DUMP"
+
+  if [[ -n $RESTORE_DUMP ]]; then
+    restore_for_downgrade
+  elif [[ $DIRECTION == newer ]]; then
+    migrate_step
+  else
+    say "    $DIRECTION release: no migration"
+  fi
+
+  if cutover_done && [[ -z $RESTORE_DUMP ]]; then
+    window_wait || undone rolled_back
+  fi
+
+  step "Backend $T_BTAG"
+  write_app_env "$APPLIED_ENV" "$T_BTAG" "$T_BDIG" "$T_FTAG" "$T_FDIG"
+  mut dc up -d --no-deps backend || rollback_app "backend did not start"
+  health_gate || rollback_app "backend did not pass its health check within ${HEALTH_TIMEOUT}s"
+  $DRY_RUN || say "    healthy"
+
+  step "Frontend $T_FTAG"
+  mut dc up -d --no-deps frontend || rollback_app "frontend did not start"
+  wait_healthy frontend 60 || rollback_app "frontend did not become healthy"
+  $DRY_RUN || say "    healthy"
+
+  apply_monitoring
+  report_pending
+  finish_install
+}
+
+finish_install() {
+  step "Finishing"
+  local bi fimg
+  bi=$(image_info "$BACKEND_IMAGE:$T_BTAG@$T_BDIG")
+  fimg=$(image_info "$FRONTEND_IMAGE:$T_FTAG@$T_FDIG")
+  history_add ok "$([[ -n $RESTORE_DUMP ]] && echo true || echo false)" "$DB_MIN_APP_AFTER"
+  state_set '.previous = .current
+    | .current = {backend_tag: $bt, backend_digest: $bd, frontend_tag: $ft, frontend_digest: $fd,
+        backend_image_id: ($bi | split(" ")[0]), frontend_image_id: ($fimg | split(" ")[0]),
+        platform: ($bi | split(" ")[1] // null)}
+    | .applied.config_sha256 = $h | .last_update_utc = $utc | .last_result = "ok" | del(.target)' \
+    --arg bt "$T_BTAG" --arg bd "$T_BDIG" --arg ft "$T_FTAG" --arg fd "$T_FDIG" \
+    --arg bi "$bi" --arg fimg "$fimg" --argjson h "$CONFIG_HASHES" --arg utc "$(utc_now)"
+  retain_update_dumps
+  local rel_b
+  rel_b=$(sed -n 's/^BACKEND_TAG=//p' "$RELEASE_FILE" | tr -d '\r"')
+  if [[ $KIND != update || -n $RESTORE_DUMP ]] && [[ $rel_b != "$T_BTAG" ]]; then
+    say "    note: the running release differs from release.env ($rel_b); a plain update.bat returns to it"
+  fi
+  say ""
+  if $DRY_RUN; then
+    say "Dry run of the install of $TARGET_LABEL (running: $CURRENT_LABEL) done; nothing was changed."
+    return 0
+  fi
+  say "Installed $TARGET_LABEL (was $CURRENT_LABEL). Log: $LOG_REL"
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+
+usage() {
+  cat <<'EOF'
+Usage: radioctl [options] <command> [arguments]
+
+Commands:
+  update [<backendTag> [<frontendTag>]]
+                    install release.env, or the given release (>= 1.0.0, newer
+                    or older; the frontend tag defaults to the backend tag)
+  rollback          install the release that ran before the last update
+  restore [<dump>]  restore the database from the last update dump or <dump>
+                    (typed RESTORE)
+  maintenance       apply pending liquidsoap/db changes (typed MAINTENANCE)
+  cutover [--undo]  start liquidsoap on the external mount, or stop it again
+                    (typed CUTOVER)
+  first-run [--media-root <path>]
+                    first configuration of a new machine (called by install.bat)
+  status            release, containers, air, pending maintenance, backups, disk
+  logs [<service>]  the last run log, or the container logs of a service
+  compose <args>    docker compose with the production files (diagnostics only)
+  backup, restore-drill
+                    Phase D6 (not implemented yet)
+
+Options:
+  --dry-run   print every step and change nothing
+  --yes       answer yes to the non-destructive questions (never to the typed
+              words RESTORE, MAINTENANCE, CUTOVER)
+  --no-wait   stop instead of waiting for the prepush window to pass
+  --no-fetch  do not git pull this repository first
+EOF
+}
+
+cmd_update() {
+  (($# <= 2)) || die "update takes at most two tags"
+  if ! installed; then
+    (($# == 0)) || die "no release is installed yet; the first run installs release.env (radioctl first-run)"
+    say "No installed release is recorded: running the first run."
+    # shellcheck disable=SC2119 # the first run from update takes no options
+    cmd_first_run
+    return
+  fi
+  preflight
+  fetch_repo
+  if (($# == 0)); then
+    declare -A REL=()
+    read_kv "$RELEASE_FILE" REL
+    T_BTAG=${REL[BACKEND_TAG]:-}
+    T_BDIG=${REL[BACKEND_DIGEST]:-}
+    T_FTAG=${REL[FRONTEND_TAG]:-}
+    T_FDIG=${REL[FRONTEND_DIGEST]:-}
+    [[ -n $T_BDIG && -n $T_FDIG ]] || die "release.env has no digest for $T_BTAG/$T_FTAG; a release PR must set them"
+    KIND=update
+  else
+    T_BTAG=$1
+    T_FTAG=${2:-$1}
+    KIND=update
+  fi
+  install_release
+}
+
+cmd_rollback() {
+  (($# == 0)) || die "rollback takes no arguments"
+  installed || die "no release is installed"
+  preflight
+  T_BTAG=$(state_get '.previous.backend_tag // empty')
+  [[ -n $T_BTAG ]] || die "no previous release is recorded; nothing to roll back to"
+  T_BDIG=$(state_get '.previous.backend_digest // empty')
+  T_FTAG=$(state_get '.previous.frontend_tag // empty')
+  T_FDIG=$(state_get '.previous.frontend_digest // empty')
+  KIND=rollback
+  install_release
+}
+
+cmd_restore() {
+  (($# <= 1)) || die "restore takes at most one dump"
+  installed || die "no release is installed"
+  preflight
+  local dump=${1:-$(state_get '.last_dump // empty')}
+  [[ -n $dump ]] || die "no dump is recorded; name one: radioctl restore <dump>"
+  if [[ ! -f $dump && -f $(envv BACKUP_ROOT)/$dump ]]; then
+    dump=$(envv BACKUP_ROOT)/$dump
+  fi
+  if [[ ! -f $dump && -n $(envv BACKUP_WINDOWS_COPY) && -f $(envv BACKUP_WINDOWS_COPY)/$dump ]]; then
+    dump=$(envv BACKUP_WINDOWS_COPY)/$dump
+  fi
+  [[ -f $dump ]] || die "dump not found: $dump"
+  load_current
+  step "Restore $(basename "$dump") (taken $(dump_time "$dump"))"
+  say "The database is replaced by this dump; every change since then is lost."
+  say "The backend stops for the restore; Liquidsoap keeps playing its queue. The release ($CURRENT_LABEL) does not change."
+  typed RESTORE "Restore $(basename "$dump")?" || refuse "Not confirmed."
+  step "Safety dump of the current database"
+  take_dump || refuse "The safety dump failed; nothing was restored."
+  say "    $DUMP"
+  step "Restoring"
+  mut dc stop backend || true
+  if ! pg_restore_dump "$dump"; then
+    start_old_backend || true
+    state_set '.last_result = "failed"'
+    die "the restore failed; the database is unchanged (one transaction). Send the log $LOG_REL to the developer"
+  fi
+  # The schema now has the dump's version: apply the running release's
+  # migrations if it is newer (a no-op otherwise).
+  local rc=0
+  mut dc run --rm --no-deps -T migrate || rc=$?
+  ((rc == 0)) || warn "migrate up after the restore exited $rc; see $LOG_REL"
+  mut dc up -d --no-deps backend || true
+  if ! health_gate; then
+    state_set '.last_result = "failed"'
+    die "the database was restored but the backend did not pass its health check; send the log $LOG_REL to the developer"
+  fi
+  state_set '.last_restore = {utc: $u, dump: $d, safety_dump: $s}' --arg u "$(utc_now)" --arg d "$dump" --arg s "$DUMP"
+  say "Restored $(basename "$dump"). Log: $LOG_REL"
+}
+
+cmd_maintenance() {
+  (($# == 0)) || die "maintenance takes no arguments"
+  installed || die "no release is installed"
+  preflight
+  step "Pending maintenance"
+  local infra list body l db_aff=false ls_aff=false
+  infra=$(infra_now) || die "cannot render the compose file; see $LOG_REL"
+  list=$(pending_list "$infra")
+  if [[ -z $list ]]; then
+    say "Nothing is pending."
+    state_set '.pending_maintenance = []'
+    return 0
+  fi
+  while IFS= read -r l; do
+    say "    $l"
+    [[ $l == db* ]] && db_aff=true
+    [[ $l == liquidsoap* ]] && ls_aff=true
+  done <<<"$list"
+  if cutover_done && body=$(api_get /api/playout/status); then
+    say "Planned in the next 15 minutes:"
+    jq -r --arg limit "$(fmt_time UTC '%Y-%m-%dT%H:%M:%SZ' "$(($(now) + 900))")" \
+      '.queued // [] | .[] | select(.planned_start_utc <= $limit) | "    \(.planned_start_utc)  \(.artist_name // "") - \(.title)"' <<<"$body" >&3 || true
+  fi
+  if $ls_aff && cutover_done; then
+    say "The stream stops for some seconds while liquidsoap restarts. The backend records an outage and marks"
+    say "items missed unless the playout journal confirms them."
+  fi
+  $db_aff && say "The database restarts: the backend and the panel are unavailable for some seconds."
+  typed MAINTENANCE "Apply these changes now?" || refuse "Not confirmed."
+  if $db_aff; then
+    step "Database dump (db is affected)"
+    take_dump || refuse "The database dump failed; nothing was restarted."
+    say "    $DUMP"
+    step "Recreating db"
+    mut dc up -d --no-deps --force-recreate db || die "db did not start; send the log $LOG_REL to the developer"
+    wait_healthy db 120 || die "db did not become healthy; send the log $LOG_REL to the developer"
+    health_gate ready || die "the backend did not reconnect to db; send the log $LOG_REL to the developer"
+  fi
+  if $ls_aff; then
+    if cutover_done; then
+      step "Recreating liquidsoap"
+      mut dc up -d --no-deps --force-recreate liquidsoap || die "liquidsoap did not start; send the log $LOG_REL to the developer"
+      if ! wait_liquidsoap 60; then
+        state_set '.last_result = "failed"'
+        say "Liquidsoap did not come back (health, control link, output connected) within 60 s."
+        say "The previous values are in state.json (applied). Send the log $LOG_REL to the developer."
+        exit 1
+      fi
+    else
+      say "    liquidsoap is not started before the cut-over; the change applies at the cut-over"
+    fi
+  fi
+  state_set '.applied += $n | .pending_maintenance = [] | .last_maintenance_utc = $u' \
+    --argjson n "$infra" --arg u "$(utc_now)"
+  say "Maintenance done. Log: $LOG_REL"
+}
+
+# wait_liquidsoap <seconds>: health check, control link, output connected.
+wait_liquidsoap() {
+  $DRY_RUN && return 0
+  wait_healthy liquidsoap "$1" || return 1
+  local deadline body
+  deadline=$(($(now) + $1))
+  while :; do
+    if body=$(api_get /api/playout/status) &&
+      jq -e '.control_link.connected == true and .output.state == "connected"' <<<"$body" >/dev/null; then
+      return 0
+    fi
+    (($(now) >= deadline)) && return 1
+    sleep_s 3
+  done
+}
+
+cmd_cutover() {
+  local undo=false
+  case ${1:-} in
+    --undo) undo=true ;;
+    "") ;;
+    *) die "cutover takes only --undo" ;;
+  esac
+  installed || die "no release is installed"
+  preflight
+  if $undo; then
+    step "Undo the cut-over: stop liquidsoap"
+    say "The stream from this system stops. Then start the old source on the old system."
+    typed CUTOVER "Stop liquidsoap?" || refuse "Not confirmed."
+    mut dc stop liquidsoap || die "could not stop liquidsoap; see $LOG_REL"
+    state_set 'del(.cutover_utc) | .cutover_undone_utc = $u' --arg u "$(utc_now)"
+    say "liquidsoap is stopped. Start the old source now. Log: $LOG_REL"
+    return 0
+  fi
+  cutover_done && {
+    say "The cut-over was done at $(state_get .cutover_utc)."
+    return 0
+  }
+  step "Cut-over preconditions"
+  local bad=() body hs he n v k want
+  api_get /readyz >/dev/null || bad+=("the backend is not ready")
+  hs=$(fmt_time UTC '%Y-%m-%dT%H:00:00Z' "$(now)")
+  he=$(fmt_time UTC '%Y-%m-%dT%H:00:00Z' "$(($(now) + 86400))")
+  if body=$(api_get "/api/track-plan?from=$hs&to=$he"); then
+    n=$(jq '[.items[] | select((.items // []) | length > 0)] | length' <<<"$body")
+    ((n >= 24)) || bad+=("the plan covers $n of the next 24 hours")
+  else
+    bad+=("the plan could not be read")
+  fi
+  v=$(setting playout.emergency_playlist_id) || v=
+  [[ -n $v && $v != null ]] || bad+=("no emergency playlist is set (playout.emergency_playlist_id)")
+  for k in stream.icecast_host stream.icecast_port stream.mount stream.icecast_tls; do
+    want=$(jq -r --arg k "$k" '.[$k] | if type == "string" then . else tojson end' <<<"$FIRST_RUN_STREAM")
+    v=$(setting "$k") || v=
+    [[ $v == "$want" ]] || bad+=("$k is '$v', expected '$want'")
+  done
+  if ((${#bad[@]})); then
+    for v in "${bad[@]}"; do say "    not ready: $v"; done
+    refuse "The cut-over is not started."
+  fi
+  say "    all preconditions met"
+  say "Stop the old source on the old system first."
+  typed CUTOVER "Start liquidsoap on $LISTEN_HINT now?" || refuse "Not confirmed."
+  local infra
+  infra=$(infra_now) || infra='{}'
+  mut dc up -d --no-deps liquidsoap || die "liquidsoap did not start; see $LOG_REL"
+  step "Waiting for the stream (60 s)"
+  if ! wait_cutover 60; then
+    say "Liquidsoap did not connect (control link, output, queued items, broadcast state) within 60 s."
+    say "It keeps retrying. To go back: 'update.bat cutover --undo', then restart the old source. Log: $LOG_REL"
+    exit 1
+  fi
+  state_set '.cutover_utc = $u | .applied += $n' --arg u "$(utc_now)" --argjson n "$infra"
+  say "Cut-over done. Listen to $LISTEN_HINT and check by ear. Log: $LOG_REL"
+}
+
+wait_cutover() {
+  $DRY_RUN && return 0
+  local deadline body
+  deadline=$(($(now) + $1))
+  while :; do
+    if body=$(api_get /api/playout/status) &&
+      jq -e '.control_link.connected == true and .output.state == "connected" and ((.queued // []) | length) > 0' <<<"$body" >/dev/null &&
+      body=$(api_get /api/broadcast/status) && [[ $(jq -r .state <<<"$body") == connected ]]; then
+      return 0
+    fi
+    (($(now) >= deadline)) && return 1
+    sleep_s 3
+  done
+}
+
+random_secret() {
+  local chars=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 out='' b
+  for b in $(od -An -N48 -tu1 /dev/urandom); do
+    out+=${chars:b%62:1}
+  done
+  printf '%s' "${out:0:32}"
+}
+
+# env_value <value>: as written to .env (single-quoted when not plain).
+env_value() {
+  if [[ $1 =~ ^[A-Za-z0-9._~@%+=:,/-]*$ ]]; then
+    printf '%s' "$1"
+  else
+    printf "'%s'" "$1"
+  fi
+}
+
+# write_env_file: .env from .env.example with the values in NEWENV.
+declare -A NEWENV=()
+write_env_file() {
+  local line key
+  (
+    umask 077
+    while IFS= read -r line || [[ -n $line ]]; do
+      if [[ $line =~ ^([A-Za-z_][A-Za-z0-9_]*)= ]]; then
+        key=${BASH_REMATCH[1]}
+        if [[ -v NEWENV[$key] ]]; then
+          printf '%s=%s\n' "$key" "$(env_value "${NEWENV[$key]}")"
+          continue
+        fi
+      fi
+      printf '%s\n' "$line"
+    done <"$ROOT/.env.example" >"$ENV_FILE.tmp"
+  )
+  mv "$ENV_FILE.tmp" "$ENV_FILE"
+}
+
+prompt_secret() {
+  local v=
+  while :; do
+    printf '%s: ' "$1" >&3
+    if [[ -t 0 ]]; then
+      IFS= read -rs v || die "no value for $1"
+      printf '\n' >&3
+    else
+      IFS= read -r v || die "no value for $1"
+    fi
+    if [[ -z $v ]]; then
+      say "    $1 may not be empty"
+      continue
+    fi
+    if [[ $v == *"'"* ]]; then
+      say "    $1 may not contain a single quote"
+      continue
+    fi
+    break
+  done
+  NEWENV[$1]=$v
+}
+
+first_run_fail() {
+  state_set '.last_result = "failed" | .first_run_failed_step = $s' --arg s "$1"
+  say ""
+  say "The first run failed at: $1. Nothing is rolled back; run update.bat (or install.bat) again after the cause is fixed."
+  say "Send the log $LOG_REL to the developer."
+  exit 1
+}
+
+# shellcheck disable=SC2120 # called as "cmd_$CMD" "$@" from main
+cmd_first_run() {
+  local media_root=
+  while (($#)); do
+    case $1 in
+      --media-root) media_root=${2:?--media-root needs a path}; shift 2 ;;
+      *) die "first-run takes only --media-root <path>" ;;
+    esac
+  done
+  if installed; then
+    die "a release is installed already ($(state_get .current.backend_tag)); use update"
+  fi
+  step "First run"
+  preflight_docker
+  if [[ ! -f $STATE_FILE ]] && docker volume inspect "${PROJECT}_pgdata" >/dev/null 2>&5; then
+    die "the database volume ${PROJECT}_pgdata exists but state.json does not: data without state needs a manual decision"
+  fi
+  local grafana_pw=
+  if [[ ! -f $ENV_FILE ]]; then
+    step "Writing .env"
+    if $DRY_RUN; then
+      say "    [dry-run] .env from .env.example with generated secrets and prompted values"
+      die "--dry-run stops here: there is no .env yet"
+    fi
+    NEWENV[POSTGRES_PASSWORD]=$(random_secret)
+    NEWENV[LIQUIDSOAP_CONTROL_PASSWORD]=$(random_secret)
+    NEWENV[GRAFANA_ADMIN_PASSWORD]=$(random_secret)
+    NEWENV[GRAFANA_DB_PASSWORD]=$(random_secret)
+    grafana_pw=${NEWENV[GRAFANA_ADMIN_PASSWORD]}
+    say "Enter the registry and stream credentials (nothing is shown or logged)."
+    prompt_secret GHCR_USER
+    prompt_secret GHCR_READ_TOKEN
+    prompt_secret ICECAST_SOURCE_PASSWORD
+    [[ -n $media_root ]] && NEWENV[MEDIA_ROOT]=$media_root
+    write_env_file
+    say "    .env written (mode 600)"
+  elif [[ -n $media_root ]]; then
+    load_env
+    if [[ $(envv MEDIA_ROOT) != "$media_root" ]]; then
+      NEWENV=()
+      read_kv "$ENV_FILE" NEWENV
+      NEWENV[MEDIA_ROOT]=$media_root
+      $DRY_RUN || write_env_file
+    fi
+  fi
+  load_env
+  check_env_vars
+  [[ -f $NETWORK_ENV ]] || die "runtime/network.env is missing; radio-network.service writes it (install.bat, D4)"
+  [[ -d $(envv MEDIA_ROOT) ]] || die "the media folder $(envv MEDIA_ROOT) does not exist"
+  [[ -d $(envv PLAYOUT_JOURNAL_ROOT) ]] || die "the journal folder $(envv PLAYOUT_JOURNAL_ROOT) does not exist (setup-distro.sh creates it)"
+  state_init
+
+  declare -A REL=()
+  read_kv "$RELEASE_FILE" REL
+  T_BTAG=${REL[BACKEND_TAG]:-}
+  T_BDIG=${REL[BACKEND_DIGEST]:-}
+  T_FTAG=${REL[FRONTEND_TAG]:-}
+  T_FDIG=${REL[FRONTEND_DIGEST]:-}
+  [[ -n $T_BDIG && -n $T_FDIG ]] || die "release.env has no digest for $T_BTAG/$T_FTAG; a release PR must set them"
+  TARGET_LABEL=$(release_label "$T_BTAG" "$T_FTAG")
+  KIND=first-run
+  step "Release check: $TARGET_LABEL"
+  local t d min_backend
+  for t in "$T_BTAG" "$T_FTAG"; do
+    if ! is_semver "$t" || ver_lt "$t" 1.0.0; then
+      die "release.env: '$t' is not a release >= 1.0.0"
+    fi
+  done
+  [[ $(major_minor "$T_BTAG") == "$(major_minor "$T_FTAG")" ]] || die "release.env: backend and frontend differ in MAJOR.MINOR"
+  min_backend=$(script_min_backend "$SCRIPT_FILE") || die "config/liquidsoap/radio.liq has no min-backend header"
+  ver_lt "$T_BTAG" "$min_backend" && die "backend $T_BTAG is below the script's min-backend $min_backend"
+  registry_login
+  d=$(resolve_digest "$BACKEND_IMAGE" "$T_BTAG") && [[ $d == "$T_BDIG" ]] || die "$BACKEND_IMAGE:$T_BTAG is not $T_BDIG in the registry"
+  d=$(resolve_digest "$FRONTEND_IMAGE" "$T_FTAG") && [[ $d == "$T_FDIG" ]] || die "$FRONTEND_IMAGE:$T_FTAG is not $T_FDIG in the registry"
+
+  write_app_env "$APPLIED_ENV" "$T_BTAG" "$T_BDIG" "$T_FTAG" "$T_FDIG"
+  record_target
+  step "Pulling images"
+  mut dc pull -q || first_run_fail "pull"
+  step "Starting the stack (liquidsoap stays stopped until the cut-over)"
+  mut dc up -d --wait db || first_run_fail "db"
+  local rc=0
+  mut dc run --rm --no-deps -T migrate || rc=$?
+  ((rc == 0)) || first_run_fail "migrate (exit $rc)"
+  mut dc up -d --no-deps backend || first_run_fail "backend"
+  health_gate ready || first_run_fail "backend health"
+  mut dc up -d --no-deps frontend || first_run_fail "frontend"
+  wait_healthy frontend 60 || first_run_fail "frontend health"
+  apply_monitoring
+
+  step "Stream settings"
+  say "Proposed stream output (panel settings, changeable at any time):"
+  jq -r 'to_entries[] | "    \(.key) = \(.value)"' <<<"$FIRST_RUN_STREAM" >&3
+  if confirm "Save these stream settings?"; then
+    if $DRY_RUN; then
+      say "    [dry-run] PATCH /api/settings"
+    else
+      api_patch_settings "$FIRST_RUN_STREAM" || first_run_fail "stream settings (PATCH /api/settings)"
+      say "    saved"
+    fi
+  else
+    say "    not saved; set them in the panel under \"Stream output (Icecast)\" before the cut-over"
+  fi
+
+  step "Backups"
+  enable_backup_timer
+
+  local infra
+  infra=$(infra_now) || infra='{}'
+  DB_SCHEMA_VERSION=0 DB_MIN_APP=$(read_min_app 2>/dev/null || echo 1.0.0)
+  history_add ok false "$DB_MIN_APP"
+  local bi fimg
+  bi=$(image_info "$BACKEND_IMAGE:$T_BTAG@$T_BDIG")
+  fimg=$(image_info "$FRONTEND_IMAGE:$T_FTAG@$T_FDIG")
+  state_set '.current = {backend_tag: $bt, backend_digest: $bd, frontend_tag: $ft, frontend_digest: $fd,
+        backend_image_id: ($bi | split(" ")[0]), frontend_image_id: ($fimg | split(" ")[0]),
+        platform: ($bi | split(" ")[1] // null)}
+    | .applied = ($n + {config_sha256: $h}) | .pending_maintenance = [] | .last_update_utc = $utc
+    | .last_result = "ok" | del(.target) | del(.first_run_failed_step)' \
+    --arg bt "$T_BTAG" --arg bd "$T_BDIG" --arg ft "$T_FTAG" --arg fd "$T_FDIG" \
+    --arg bi "$bi" --arg fimg "$fimg" --argjson n "$infra" --argjson h "$CONFIG_HASHES" --arg utc "$(utc_now)"
+  say ""
+  say "First run done: $TARGET_LABEL is running; liquidsoap waits for the cut-over ('update.bat cutover')."
+  say "Panel: http://127.0.0.1:$(envv PANEL_PORT 8080)"
+  # Shown once, when the first run completes (also after a failed first
+  # run that had already generated it).
+  grafana_pw=$(envv GRAFANA_ADMIN_PASSWORD)
+  if [[ -n $grafana_pw ]] && monitoring_enabled; then
+    say "Grafana: http://127.0.0.1:$(envv GRAFANA_PORT 3000), user admin, password (shown once, not logged):"
+    printf '    %s\n' "$grafana_pw" >&3
+  fi
+  say "Log: $LOG_REL"
+}
+
+# enable_backup_timer: D6 boundary (radio-backup.timer and the first
+# backup, plan 6.8 step 7).
+enable_backup_timer() {
+  say "    the daily backup timer and the first backup are Phase D6 (not done by this version)"
+}
+
+cmd_status() {
+  load_env || die ".env is missing: this machine has no first run yet"
+  local body
+  say "Release"
+  if installed; then
+    say "    running   $(release_label "$(state_get .current.backend_tag)" "$(state_get .current.frontend_tag)")"
+    [[ -n $(state_get '.previous.backend_tag // empty') ]] &&
+      say "    previous  $(release_label "$(state_get .previous.backend_tag)" "$(state_get .previous.frontend_tag)")"
+  else
+    say "    none installed"
+  fi
+  declare -A REL=()
+  read_kv "$RELEASE_FILE" REL
+  say "    release.env $(release_label "${REL[BACKEND_TAG]:-?}" "${REL[FRONTEND_TAG]:-?}")"
+  say "    last result $(state_get '.last_result // "none"') $(state_get '.last_update_utc // ""')"
+  [[ -n $(state_get '.target.backend_tag // empty') ]] &&
+    say "    an update to $(state_get .target.backend_tag) did not finish"
+  say "    cut-over    $(state_get '.cutover_utc // "not yet"')"
+
+  say "Containers"
+  if [[ -f $APPLIED_ENV && -f $NETWORK_ENV ]] && body=$(dc ps --all --format json 2>&5); then
+    jq -rs 'flatten | .[] | "    \(.Service | . + (" " * (14 - length))) \(.State)\(if (.Health // "") != "" then " (" + .Health + ")" else "" end)"' <<<"$body" >&3 || true
+  else
+    say "    unknown (compose did not answer)"
+  fi
+  local boot
+  boot=$(find "$LOG_DIR" -maxdepth 1 -name 'boot-*.log' 2>/dev/null | LC_ALL=C sort | tail -n 1) || true
+  if [[ -n $boot ]]; then
+    say "    boot check: $(tail -n 1 "$boot")"
+  fi
+
+  say "Air"
+  if body=$(api_get /api/broadcast/status); then
+    say "    broadcast $(jq -r '.state' <<<"$body")"
+  else
+    say "    broadcast unknown (backend not reachable)"
+  fi
+  if body=$(api_get /api/status/live); then
+    say "    live on air: $(jq -r '.on_air' <<<"$body")"
+  fi
+  if body=$(api_get /api/playout/status); then
+    say "    control link $(jq -r '.control_link.connected' <<<"$body"), output $(jq -r '.output.state // "unknown"' <<<"$body"), queued $(jq '(.queued // []) | length' <<<"$body")"
+  fi
+
+  say "Pending maintenance"
+  local p line
+  p=$(state_get '.pending_maintenance // [] | .[]')
+  if [[ -z $p ]]; then
+    say "    none"
+  else
+    while IFS= read -r line; do say "    $line"; done <<<"$p"
+  fi
+
+  say "Backups"
+  say "    last update dump $(state_get '.last_dump // "none"')"
+  say "    last daily backup $(state_get '.last_backup_utc // "none (D6)"')"
+
+  say "Disk"
+  local path pct
+  for path in "$ROOT" "$(envv BACKUP_ROOT)" "$(envv MEDIA_ROOT)"; do
+    [[ -e $path ]] || continue
+    line=$(df -P "$path" 2>/dev/null | tail -n 1) || continue
+    pct=$(awk '{gsub("%", "", $5); print $5}' <<<"$line")
+    if ((100 - pct < 15)); then
+      say "    LOW SPACE: $path ($((100 - pct))% free)"
+    else
+      say "    $path: $((100 - pct))% free"
+    fi
+  done
+
+  say "Media"
+  local media
+  media=$(envv MEDIA_ROOT)
+  if [[ ! -d $media ]]; then
+    say "    MISSING: $media is not mounted (is the Windows drive connected?)"
+  elif [[ ! -w $media ]]; then
+    say "    NOT WRITABLE: $media (group radio-media write is needed for transcodes)"
+  else
+    say "    $media ok"
+  fi
+}
+
+cmd_logs() {
+  if (($# == 0)); then
+    local last
+    last=$(find "$LOG_DIR" -maxdepth 1 -name '*.log' ! -name 'boot-*' 2>/dev/null | LC_ALL=C sort | tail -n 1) || true
+    [[ -n $last ]] || die "no run log yet"
+    printf '%s\n' "$last"
+    tail -n 100 "$last"
+    return 0
+  fi
+  load_env || die ".env is missing"
+  dc logs --tail 200 "$@"
+}
+
+cmd_compose() {
+  load_env || die ".env is missing"
+  [[ -f $APPLIED_ENV ]] || die "runtime/applied.env is missing: nothing is installed"
+  dc "$@"
+}
+
+cmd_d6() {
+  die "'$1' is Phase D6 and not implemented in this version"
+}
+
+main() {
+  local args=() a
+  while (($#)); do
+    a=$1
+    shift
+    case $a in
+      --dry-run) DRY_RUN=true ;;
+      --yes | -y) YES=true ;;
+      --no-wait) NO_WAIT=true ;;
+      --no-fetch) NO_FETCH=true ;;
+      -h | --help) usage; exit 0 ;;
+      compose | logs)
+        if ((${#args[@]} == 0)); then
+          args+=("$a" "$@")
+          break
+        fi
+        args+=("$a")
+        ;;
+      *) args+=("$a") ;;
+    esac
+  done
+  set -- "${args[@]}"
+  CMD=${1:-update}
+  (($#)) && shift
+  case $CMD in
+    status) cmd_status "$@" ;;
+    logs) cmd_logs "$@" ;;
+    compose) cmd_compose "$@" ;;
+    backup | restore-drill) cmd_d6 "$CMD" ;;
+    update | rollback | restore | maintenance | cutover | first-run)
+      mkdir -p "$LOG_DIR"
+      take_lock
+      open_log "$CMD"
+      $DRY_RUN && say "DRY RUN: nothing is changed."
+      "cmd_${CMD//-/_}" "$@"
+      ;;
+    *) usage >&2; exit 2 ;;
+  esac
+}
+
+main "$@"
