@@ -6,8 +6,8 @@ backend and frontend run as prebuilt images from GitHub Container Registry.
 
 The runbook (install, update, rollback, restore, maintenance, backups) is
 written in Phase D7 of `docs/deploy-init-plan.md`. Until then, see that plan
-and `docs/tech-design.md` §9. The two sections below (Phase D3) become part of
-it.
+and `docs/tech-design.md` §9. The sections below (Phases D3 and D5) become
+part of it.
 
 ## Production playout script
 
@@ -79,3 +79,58 @@ operator and the server owner:
   44100 Hz, stereo, name "Radio Atlantida" (the current stream's format).
 - **Outages.** The outage detector watches the external server: a provider
   outage opens an outage and marks items missed, like any other.
+
+## Update tool (`update.bat` -> `bin/radioctl`)
+
+`update.bat` runs `bin/radioctl` inside the WSL distribution `radio-atlantida`
+as the user `radio` (`/opt/radio-atlantida/deploy`). `radioctl` is the only
+way to change the production stack: it records in `state.json` what a
+rollback and a restore need. Every changing command writes
+`logs/<command>-YYYY-MM-DDTHHMMSSZ.log` (UTC); secrets are never printed or
+logged.
+
+| Command | What it does |
+|---------|--------------|
+| `update.bat` | `git pull --ff-only`, then install `release.env` |
+| `update.bat <backend> [<frontend>]` | install any release >= 1.0.0, newer or older (frontend tag defaults to the backend tag) |
+| `update.bat rollback` | install the release that ran before the last install, by digest |
+| `update.bat restore [<dump>]` | restore the last update dump, or `<dump>`; typed `RESTORE` |
+| `update.bat maintenance` | apply pending `liquidsoap`/`db` changes; typed `MAINTENANCE` |
+| `update.bat cutover [--undo]` | start (or stop) `liquidsoap` on the external mount; typed `CUTOVER` |
+| `update.bat first-run` | first configuration of a new machine (called by `install.bat`) |
+| `update.bat status` | release, containers, air, pending maintenance, backups, disk, media |
+| `update.bat logs [<service>]` | the last run log, or a service's container log |
+| `update.bat compose <args>` | `docker compose` with the production files, for diagnostics |
+
+Options: `--dry-run` (print every step, change nothing), `--yes` (answer the
+non-destructive questions; never a typed word), `--no-wait` (stop instead of
+waiting for the prepush window), `--no-fetch`.
+
+An update (plan 7.3): preflight; release check (images and digests,
+MAJOR.MINOR, the script's `min-backend`, the downgrade guard
+`schema_compat.min_app_version`); air check after the cut-over (open outage
+stops, live on air asks, at least 2 items queued, not around the hour
+boundary); pull; a mandatory `pg_dump`; `migrate up` while the old backend
+runs (newer targets only); backend, health gate, frontend; Loki, Alloy,
+Grafana (warnings only); pending maintenance is reported, `liquidsoap` and
+`db` are never restarted. Every failure ends with "Update to X failed and was
+undone. Broadcasting continues on Y. Send the log ... to the developer." A
+migration exit 5 (dirty) restores the pre-update dump automatically; a
+failed health gate reinstalls the previous release by digest.
+
+Not in this version: `backup`, `restore-drill`, the daily timer, the journal
+and Windows copies of a dump (Phase D6); `install.ps1`, `setup-distro.sh`,
+and `radio-network.service`, which writes `runtime/network.env` (Phase D4).
+
+Tests (bats-core 1.11.1 in Docker; `docker`, `git`, and the clock are
+stubs, so no stack is needed):
+
+```sh
+tests/radioctl/run.sh            # all tests
+tests/radioctl/run.sh -f restore # by name
+```
+
+Dry-run switches (environment only, never `.env`): `COMPOSE_PROJECT_NAME`,
+`RADIOCTL_BACKEND_IMAGE`, `RADIOCTL_FRONTEND_IMAGE` (a test registry),
+`RADIOCTL_COMPOSE_OVERRIDE` (an extra compose file), `RADIOCTL_HEALTH_TIMEOUT`,
+`RADIOCTL_LOCK_WAIT`, `RADIOCTL_FAKE_CLOCK` (tests).
