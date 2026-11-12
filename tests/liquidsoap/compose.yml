@@ -1,0 +1,92 @@
+# Runtime smoke test of the production playout script
+# (deploy-init-plan.md D3, 9.1 item 6). Run by tests/liquidsoap/run.sh, which
+# drives it with the backend's own smoke tool (dev/liqsmoke at the same
+# backend ref as the script), so the checks are those of the backend CI.
+#
+# `liquidsoap` extends the production service of ../../docker-compose.yml
+# unchanged: the same image, command, environment (BACKEND_*_URL on
+# http://backend:8090, OUTPUT_STATE_FILE, ICECAST_TLS=true), the script
+# mount, the state volume, and the health check. This file only adds the
+# test CA, the published control port, and the test servers:
+# - icecast: the test Icecast (plain), as the backend's dev/liqsmoke;
+# - tlsproxy: TLS in front of it, as the production server (TLS only);
+# - backend: a TCP proxy to the smoke tool's stub backend on the host, so
+#   the production URLs reach it.
+#
+# Image pins equal the backend's dev/liqsmoke/compose.yml
+# (scripts/check-backend-sync.sh). Published ports equal the smoke tool's
+# defaults, all on 127.0.0.1.
+
+name: radio-deploy-liqsmoke
+
+services:
+  icecast:
+    image: libretime/icecast:2.4.4-alpine
+    environment:
+      ICECAST_SOURCE_PASSWORD: ${ICECAST_SOURCE_PASSWORD:?set by run.sh}
+      ICECAST_ADMIN_PASSWORD: smoke-admin
+      ICECAST_RELAY_PASSWORD: smoke-relay
+      ICECAST_HOSTNAME: localhost
+      ICECAST_MAX_SOURCES: "4"
+    ports:
+      - "127.0.0.1:18000:8000"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8000/status-json.xsl"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    networks: [radio]
+
+  tlsproxy:
+    image: nginxinc/nginx-unprivileged:1.29.8-alpine
+    volumes:
+      - ./tlsproxy.conf:/etc/nginx/nginx.conf:ro
+      - ${LIQSMOKE_CERTS:?set by run.sh}:/certs:ro
+    depends_on:
+      icecast:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "8443"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    networks: [radio]
+
+  backend:
+    image: nginxinc/nginx-unprivileged:1.29.8-alpine
+    volumes:
+      - ./backend-proxy.conf:/etc/nginx/nginx.conf:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "8090"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    networks: [radio]
+
+  liquidsoap:
+    extends:
+      file: ../../docker-compose.yml
+      service: liquidsoap
+    # The smoke tool fails a case at once when Liquidsoap exits (an encoder
+    # error); a restart policy would hide the exit.
+    restart: "no"
+    # The smoke tool sends output.set over the published control port.
+    ports:
+      - "127.0.0.1:11234:1234"
+    volumes:
+      # The test CA takes the place of the system roots (the production
+      # server has a public certificate).
+      - ${LIQSMOKE_CERTS:?set by run.sh}/ca.pem:/etc/ssl/certs/ca-certificates.crt:ro
+    depends_on:
+      icecast:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+
+networks:
+  radio: {}
+
+volumes:
+  liquidsoap-state:
