@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Stub of git for the bats tests of bin/radioctl (calls in $STUB_DIR/calls.log).
+#   git_head        the commit HEAD prints
+#   git_pull.rc     exit code of `git pull`
+#   git_new_head    if present, `git pull` moves HEAD to it
+set -uo pipefail
+S=${STUB_DIR:?}
+printf 'git %s\n' "$*" >>"$S/calls.log"
+[[ ${1:-} == -C ]] && shift 2
+case ${1:-} in
+  rev-parse) cat "$S/git_head" 2>/dev/null || echo aaaaaaa ;;
+  pull)
+    if [[ -f $S/git_pull.rc ]]; then exit "$(<"$S/git_pull.rc")"; fi
+    [[ -f $S/git_new_head ]] && mv "$S/git_new_head" "$S/git_head"
+    exit 0
+    ;;
+  log) echo "bbbbbbb a change" ;;
+  *) exit 0 ;;
+esac

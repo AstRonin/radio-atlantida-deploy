@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+# Stub of the docker CLI for the bats tests of bin/radioctl. Every call is
+# appended to $STUB_DIR/calls.log. Answers come from files in $STUB_DIR
+# (see tests/radioctl/helpers.bash, which writes the defaults):
+#
+#   <name>.out / <name>.rc     output and exit code of a call (rc default 0)
+#   api/<key>[@<tag>].out|rc   GET <path> through the backend's curl; <key> is
+#                              the path without query, "/" -> "_"; @<tag>
+#                              answers only while that backend tag runs
+#   registry/<image>:<tag>     the manifest list digest of an image
+#   running_backend            the backend tag that runs ("stopped" if none)
+#   health_<service>           container health (default healthy)
+#   db_min_app_after.out       min_app_version once `migrate up` ran
+set -uo pipefail
+S=${STUB_DIR:?}
+printf '%s\n' "$*" >>"$S/calls.log"
+
+# answer <name> [default output]: prints <name>.out (or the default) and
+# exits with <name>.rc.
+answer() {
+  if [[ -f $S/$1.out ]]; then
+    cat "$S/$1.out"
+  elif [[ -n ${2:-} ]]; then
+    printf '%s\n' "$2"
+  fi
+  if [[ -f $S/$1.rc ]]; then
+    exit "$(<"$S/$1.rc")"
+  fi
+  exit 0
+}
+
+running() { cat "$S/running_backend" 2>/dev/null || echo stopped; }
+
+compose() {
+  local envfiles=()
+  while (($#)); do
+    case $1 in
+      --project-directory | -f | --profile | -p) shift 2 ;;
+      --env-file) envfiles+=("$2"); shift 2 ;;
+      *) break ;;
+    esac
+  done
+  local sub=$1
+  shift
+  local tag
+  tag=$(grep -h '^BACKEND_TAG=' "${envfiles[@]}" 2>/dev/null | tail -n 1 | cut -d= -f2)
+  case $sub in
+    config) answer compose_config ;;
+    pull) answer pull ;;
+    up)
+      local a svcs=()
+      for a in "$@"; do [[ $a == -* ]] || svcs+=("$a"); done
+      for a in "${svcs[@]}"; do
+        printf 'UP %s %s\n' "$a" "$tag" >>"$S/events.log"
+        [[ $a == backend ]] && printf '%s\n' "$tag" >"$S/running_backend"
+        if [[ -f $S/up_$a.rc ]]; then exit "$(<"$S/up_$a.rc")"; fi
+      done
+      exit 0
+      ;;
+    stop)
+      local a
+      for a in "$@"; do
+        printf 'STOP %s\n' "$a" >>"$S/events.log"
+        [[ $a == backend ]] && echo stopped >"$S/running_backend"
+      done
+      exit 0
+      ;;
+    run)
+      while [[ ${1:-} == -* ]]; do shift; done
+      local svc=$1
+      shift
+      case "$svc $*" in
+        "migrate migrate target-compat") answer "target_compat@$tag" "$(cat "$S/target_compat" 2>/dev/null || echo 1.0.0)" ;;
+        "migrate ")
+          printf 'MIGRATE %s\n' "$tag" >>"$S/events.log"
+          # A contract migration: min_app_version changes once it ran.
+          [[ -f $S/db_min_app_after.out ]] && mv "$S/db_min_app_after.out" "$S/db_min_app.out"
+          if [[ -f $S/migrate_up@$tag.rc ]]; then exit "$(<"$S/migrate_up@$tag.rc")"; fi
+          answer migrate_up
+          ;;
+        "grafana-role ") answer grafana_role ;;
+        *) exit 0 ;;
+      esac
+      ;;
+    exec)
+      while [[ ${1:-} == -* ]]; do shift; done
+      local svc=$1
+      shift
+      case $svc in
+        backend) backend_exec "$@" ;;
+        db) db_exec "$@" ;;
+        *) exit 0 ;;
+      esac
+      ;;
+    ps)
+      if [[ ${1:-} == -q ]]; then
+        echo "cid-$2"
+      else
+        echo '[]'
+      fi
+      ;;
+    logs) echo "logs $*" ;;
+    *) exit 0 ;;
+  esac
+}
+
+backend_exec() {
+  local run url a patch=false
+  run=$(running)
+  [[ $run == stopped ]] && exit 1
+  for a in "$@"; do
+    [[ $a == http://* ]] && url=$a
+    [[ $a == PATCH ]] && patch=true
+  done
+  if $patch; then
+    cat >"$S/patch_body"
+    answer patch_settings '{"items":[]}'
+  fi
+  local path=${url#http://127.0.0.1:8090/}
+  path=${path%%\?*}
+  local key=${path//\//_}
+  if [[ -f $S/api/$key@$run.out || -f $S/api/$key@$run.rc ]]; then
+    answer "api/$key@$run"
+  fi
+  answer "api/$key"
+}
+
+db_exec() {
+  local all="$*"
+  case $all in
+    *pg_dump*)
+      printf 'DUMP\n' >>"$S/events.log"
+      if [[ -f $S/pg_dump.rc ]]; then exit "$(<"$S/pg_dump.rc")"; fi
+      echo "PGDMP fake dump"
+      ;;
+    *pg_restore*)
+      cat >"$S/restored_from"
+      printf 'RESTORE\n' >>"$S/events.log"
+      answer pg_restore
+      ;;
+    *"schema_migrations') IS NOT NULL"*) answer db_has_migrations t ;;
+    *"version || ' ' || dirty"*) answer db_version "22 f" ;;
+    *"schema_compat') IS NOT NULL"*) answer db_has_compat t ;;
+    *"min_app_version FROM schema_compat"*) answer db_min_app 1.0.0 ;;
+    *) exit 0 ;;
+  esac
+}
+
+case ${1:-} in
+  info) answer docker_info ;;
+  version) answer docker_version 28.0.1 ;;
+  login)
+    cat >/dev/null
+    answer login
+    ;;
+  buildx)
+    [[ ${2:-} == version ]] && exit 0
+    ref=${*: -1}
+    name=${ref##*/}
+    if [[ -f $S/registry/$name ]]; then
+      printf '{"mediaType":"application/vnd.oci.image.index.v1+json","digest":"%s"}\n' "$(<"$S/registry/$name")"
+      exit 0
+    fi
+    echo "ERROR: $ref: not found" >&2
+    exit 1
+    ;;
+  image) echo "sha256:imageid linux/amd64" ;;
+  inspect)
+    cid=${*: -1}
+    cat "$S/health_${cid#cid-}" 2>/dev/null || echo healthy
+    ;;
+  volume) answer volume_inspect ;;
+  ps) answer docker_ps ;;
+  stop) exit 0 ;;
+  pull) exit 0 ;;
+  compose)
+    shift
+    if [[ ${1:-} == version ]]; then answer compose_version 2.34.0; fi
+    compose "$@"
+    ;;
+  *) exit 0 ;;
+esac
