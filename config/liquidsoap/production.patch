@@ -1,0 +1,13 @@
+# Production overrides of the backend's dev/liquidsoap/radio.liq
+# (deploy-init-plan.md D3, 11.2): a unified diff below these comment lines,
+# applied with `patch` by scripts/check-backend-sync.sh. config/liquidsoap/
+# radio.liq is the dev script at v${BACKEND_TAG} with this patch applied.
+#
+# Empty on purpose: the dev script takes every startup value from the
+# environment, and docker-compose.yml sets the production values (the
+# backend URLs on http://backend:8090, OUTPUT_STATE_FILE, ICECAST_TLS=true,
+# the secrets). The stream itself (host, port, mount, TLS, format, name)
+# comes from the backend's stream.* settings at runtime (output.set). The
+# script's built-in defaults (stream name "Radio Atlantida", log level 3)
+# are right for production. Any other difference between the two scripts
+# is a bug in one of them, fixed in the backend.
