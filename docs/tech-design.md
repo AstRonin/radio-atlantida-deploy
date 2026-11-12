@@ -1,14 +1,14 @@
 # Radio Automation System: Technical Design
 
-Status: Draft (v7-23)
-Last updated: 2026-10-17
+Status: Draft (v7-24)
+Last updated: 2026-11-12
 
 ## 1. Overview
 
 The system manages a radio station's programming and broadcasts it online. It covers:
 
 - a content library (tracks, jingles, news, segments) organized into playlists, where every playlist has a type that the manager can extend;
-- hourly clock templates (60 minutes) and a weekly grid that assigns clocks to time slots, planned up to 30 days ahead;
+- hourly clock templates (60 minutes) and a weekly grid that assigns clocks to time slots, planned up to 183 days (about six months) ahead (`rotation.grid_horizon_days`, §6.3);
 - a rolling track plan (24 to 48 hours) that respects play rules (time windows, track and artist intervals, plays per hour);
 - play rules (time windows, minimum intervals, plays per hour) that the manager creates on a separate page and applies to tracks or playlists, mostly for jingles;
 - a play button for tracks in the panel, so the manager can listen without leaving the admin;
@@ -30,16 +30,17 @@ The system is developed in three Git repositories. Each repository has one purpo
 |------------|----------|----------|
 | `radio-atlantida-backend` | Go backend: REST API, WebSocket hub, clock/grid/rotation engine, outage detector, WebRTC live voice bridge, Liquidsoap control client, track preview audio endpoint (§6.6), play log writer, reconciliation job, retention job, versioned migrations (`.up.sql`), OpenAPI specification generation (§6.4) | Builds the `radio-atlantida-backend` image (§9.2) |
 | `radio-atlantida-frontend` | Angular management panel, static help texts (§6.1), validation (§6.2), settings pages (§6.3), played-tracks list with missed items, track player (§6.6), TypeScript client generated from the backend OpenAPI specification (§6.4) | Builds the `radio-atlantida-frontend` image (§9.2) |
-| `radio-atlantida-deploy` | `docker-compose.yml`, `.env.example`, `update.bat`, `update.ps1`, `config/` (Liquidsoap script and Icecast configuration for the test stack), `README.md` | Runs the stack on the production Windows host. Contains no application code (§9.2) |
+| `radio-atlantida-deploy` | `docker-compose.yml`, `.env.example`, `release.env`, `install.bat`/`install.ps1` (host setup), `update.bat` and `bin/radioctl` (update tool), `config/` (the production Liquidsoap script and the Grafana, Loki, and Alloy configuration, copied from the backend's `dev/` at the pinned tag), `README.md` | Runs the stack on the production Windows host. Contains no application code and no Icecast (§9.2) |
 
 Rules for using the code:
 
 - The repositories are hosted on GitHub under the account `AstRonin` (for example, https://github.com/AstRonin/radio-atlantida-backend). Container images are published to GitHub Container Registry under the lowercase owner name, `ghcr.io/astronin/`, which is the form the registry requires.
 - Each repository has its own GitHub Actions workflow that builds and pushes its image on tagged releases (§9.2).
-- The backend and the frontend are released together under one version tag. The OpenAPI specification produced by the backend at that tag is the input for the frontend client build, so a frontend build always matches the backend it runs against.
-- The deploy repository refers to application images by tag only (`IMAGE_TAG`). It never builds application code.
+- The backend and the frontend are released with their own version tags (v7-24). The OpenAPI specification attached to a backend release is the input for the frontend client build. A frontend runs against any backend of the same MAJOR.MINOR version, so a frontend-only or backend-only fix does not force a release of the other (§9.2).
+- Each release tag is a multi-arch image for `linux/amd64` and `linux/arm64` (v7-24, §9.2).
+- The deploy repository refers to application images by tag and the digest of their multi-arch manifest list (`BACKEND_TAG`, `FRONTEND_TAG` and their digests in `release.env`). It never builds application code.
 - Database migrations live in `radio-atlantida-backend` and are shipped inside the `radio-atlantida-backend` image. The deploy repository does not contain migration files.
-- Liquidsoap scripts and Icecast configuration that are part of the test stack are kept in `radio-atlantida-deploy/config/`. Production stream settings are stored in the database through the admin panel (§6.3, §8.8) and are not kept in any repository.
+- The development Liquidsoap script and the Icecast test container are part of the backend's dev stack. The production Liquidsoap script in `radio-atlantida-deploy/config/` is the dev script at the pinned backend tag plus a reviewed patch (v7-24). Production stream settings are stored in the database through the admin panel (§6.3, §8.8) and are not kept in any repository; the production Icecast is an external server.
 
 ## 2. Architecture
 
@@ -93,7 +94,7 @@ Responsibilities:
 | Database          | PostgreSQL                                | Relational core |
 | DB access         | GORM for admin CRUD; pgx for hot paths    | See §5 and §5.1 |
 | Playout           | Liquidsoap                                | Linux container |
-| Stream server     | Icecast                                   | Test instance in Docker; production server configured in the admin panel |
+| Stream server     | Icecast                                   | Test instance in Docker (development only); production: an external server configured in the admin panel (§8.8) |
 | Audio tooling     | ffmpeg                                    | Transcoding and quality analysis on import |
 | Containers        | Docker and Docker Compose                 | Linux containers, one compose file. Deployment repository: `radio-atlantida-deploy` |
 
@@ -108,12 +109,12 @@ Responsibilities:
 | PostgreSQL driver           | `github.com/jackc/pgx/v5`      | Hot paths: play log, rotation queries, play rule interval checks, reconciliation (§5) |
 | ORM                         | `gorm.io/gorm`                 | Admin CRUD (§5) |
 | Migrations                  | `golang-migrate`               | Versioned schema changes (§5). Migration files are kept in `radio-atlantida-backend` |
-| Logging                     | `log/slog` (standard library)  | JSON handler, daily file rotation (§10.1) |
+| Logging                     | `log/slog` (standard library)  | JSON handler to stdout, with a push of each entry to Loki (§10.1) |
 | OpenAPI generation          | To be chosen at implementation | Generates the specification from Go code (§6.4) |
 
 **Configuration split**
 
-- **Environment variables** (`caarlos0/env`): the database connection (URL and credentials), secrets (`ICECAST_SOURCE_PASSWORD`, `LIQUIDSOAP_CONTROL_USER`, `LIQUIDSOAP_CONTROL_PASSWORD`), and the host paths `MEDIA_ROOT`, `LOG_ROOT`, and `PLAYOUT_JOURNAL_ROOT`. The host paths are set once in the Compose `.env` file and never change. Like the API listen address (`HTTP_ADDR`), the UDP address of the live voice bridge (`LIVE_UDP_ADDR`) and the addresses on which the browser reaches it (`LIVE_PUBLIC_IPS`) are environment variables, because they belong to the compose port mapping (v7-15, `docs/phase-12-plan.md` §2). `PLAYOUT_JOURNAL_ROOT` is the host directory to which Liquidsoap writes its playout journal (§7.1); the backend mounts it read-only. All other backend settings are managed in the admin panel (see §6.3).
+- **Environment variables** (`caarlos0/env`): the database connection (URL and credentials), secrets (`ICECAST_SOURCE_PASSWORD`, `LIQUIDSOAP_CONTROL_USER`, `LIQUIDSOAP_CONTROL_PASSWORD`), the host paths `MEDIA_ROOT` and `PLAYOUT_JOURNAL_ROOT`, and the Loki push address `LOKI_URL` (empty turns the push off, §10.1). The host paths are set once in the Compose `.env` file and never change. Like the API listen address (`HTTP_ADDR`), the UDP address of the live voice bridge (`LIVE_UDP_ADDR`) and the addresses on which the browser reaches it (`LIVE_PUBLIC_IPS`) are environment variables, because they belong to the compose port mapping (v7-15, `docs/phase-12-plan.md` §2). `PLAYOUT_JOURNAL_ROOT` is the host directory to which Liquidsoap writes its playout journal (§7.1); the backend mounts it read-only. All other backend settings are managed in the admin panel (see §6.3).
 - **Admin settings (PostgreSQL)**: the Icecast output profile, station timezone, fade length, outage detection thresholds, and other backend settings are edited in the Angular admin panel and stored in the database (see §6.3).
 
 **Precedence (highest first)**
@@ -134,10 +135,10 @@ Entities are stored in separate tables and linked by IDs. Foreign keys are enfor
   - A type that is used by any playlist or track cannot be deleted. The API refuses the request and names the playlists that use it.
   - The type does not change how rotation works. It is a label for the manager (filters and badges in the panel). It does not limit which playlists a clock combines: one clock may use playlists of different types, for example music and jingle.
 - **playlists**: id, name, type_id (FK to `playlist_types`), created_at.
-- **artists**: id, name. Used for the artist interval of play rules (§7.3).
+- **artists**: id, name. Used for the artist interval of play rules (§7.3). A track has at most one artist (`tracks.artist_id`, nullable, `ON DELETE RESTRICT`): an artist with tracks cannot be deleted (§6.4, artists).
 - **tracks**: id, title, artist_id, duration_ms, file_path (relative to the media root, see §8.7), format, bitrate, sample_rate, quality_ok (bool), quality_notes, type_id (FK to `playlist_types`), file_checksum, created_at.
   - `reviewed_at` (timestamptz, nullable; v7-21, `docs/phase-21-plan.md` §2): when the manager marked the track checked, set and cleared only in bulk (`POST /api/tracks/review`). A change of the track's content clears it in the same statement: a new title, artist, or file path, and an analysis or transcode that stores a different `file_checksum`. Playlists, type, notes, the quality override, and play rules do not. It is separate from `quality_ok`.
-  - Cue points and fades (v7-22, `docs/phase-22-plan.md` §2): `cue_in_ms` (int, default 0), `cue_out_ms` (int, nullable: the end of the file), `fade_in_ms` and `fade_out_ms` (int 0 to 5000, default 0: a hard cut). They mark the part of the file that goes on air; the file is never changed. The on-air length is `cue_out_ms` (or `duration_ms`) minus `cue_in_ms`; `duration_ms` stays the length of the file. The database checks the order and the fade range (`ck_tracks_cue`, `ck_tracks_fades`); the checks against the duration are in the service. A cut leaves at least 5 s on air. An analysis that stores a different `file_checksum`, or an update with a new duration, keeps a cue that still fits and resets all four columns in the same statement otherwise. A cue change keeps `reviewed_at`.
+  - Cue points and fades (v7-22, `docs/phase-22-plan.md` §2): `cue_in_ms` (int, default 0), `cue_out_ms` (int, nullable: the end of the file), `fade_in_ms` and `fade_out_ms` (int 0 to 5000, default 0: a hard cut). They mark the part of the file that goes on air; the file is never changed. The on-air length is `cue_out_ms` (or `duration_ms`) minus `cue_in_ms`, stored by PostgreSQL in the generated column `air_duration_ms` (NULL while `duration_ms` is NULL; `docs/track-stats-plan.md`); `duration_ms` stays the length of the file. The database checks the order and the fade range (`ck_tracks_cue`, `ck_tracks_fades`); the checks against the duration are in the service. A cut leaves at least 5 s on air. An analysis that stores a different `file_checksum`, or an update with a new duration, keeps a cue that still fits and resets all four columns in the same statement otherwise. A cue change keeps `reviewed_at`.
   - Analysis columns (v7-14, `docs/phase-11-plan.md` §2): codec, channels, loudness_lufs, true_peak_dbtp, loudness_range_lu (EBU R128), source_bitrate (the lossy file a transcoded file was made from), quality_issues (`text[]` of `format`, `sample_rate`, `channels`, `loudness`, `true_peak`, `low_bitrate`, `file_missing`), analyzed_at. An analysis sets `quality_ok` to "no issues"; a manual value lasts until the next analysis. `file_checksum` is the SHA-256 of the file, indexed for the duplicate check of an import.
 - **track_playlists**: track_id, playlist_id (many-to-many). A track may belong to several playlists.
 - **playlists** gain (v7-23, `docs/phase-23-plan.md` §3.1): clock_rule (`fill` (default), `spread`, `start`, `end`, `start_end`, `middle`), clock_count (smallint 1 to 12; set only and required for `spread`). The placement rule of the playlist in clocks (§7.2); a clock may override it.
@@ -145,7 +146,7 @@ Entities are stored in separate tables and linked by IDs. Foreign keys are enfor
 - **clock_playlists** (v7-23): clock_id (FK, `ON DELETE CASCADE`), playlist_id (FK, `ON DELETE RESTRICT`: a playlist in a clock cannot be deleted), position, clock_rule (nullable: the playlist's own rule), clock_count (nullable; `spread` only), fill_weight (smallint 1 to 100, nullable). Primary key (clock_id, playlist_id), unique (clock_id, position).
   - A clock has at least one playlist whose effective rule is `fill`. Either every fill row of a clock has a `fill_weight` or none has (checked by the service, which knows the effective rule).
 - **clock_inserts** (v7-23): id, clock_id (FK, `ON DELETE CASCADE`), offset_ms (0 to 3 599 000, whole seconds), tolerance_ms (default 60000, 0 to 600000), track_id (nullable, FK `ON DELETE RESTRICT`), playlist_id (nullable, FK `ON DELETE RESTRICT`). Exactly one of track_id and playlist_id is set; unique (clock_id, offset_ms). A timed insert of the template: it plays in every hour of the clock (§7.2).
-- **grid_slots**: id, weekday (1 = Monday to 7 = Sunday), hour, clock_id, valid_from, valid_to (dates, both inclusive; null `valid_to` is open-ended). Weekday and hour are in station local time (see §10.2). Covers up to 30 days ahead.
+- **grid_slots**: id, weekday (1 = Monday to 7 = Sunday), hour, clock_id, valid_from, valid_to (dates, both inclusive; null `valid_to` is open-ended). Weekday and hour are in station local time (see §10.2). Covers up to the grid horizon ahead (`rotation.grid_horizon_days`, 1 to 183 days, default 183).
   - At most one clock per weekday and hour on any date: an exclusion constraint forbids two slots with the same weekday and hour and overlapping date ranges.
   - Saving a slot that overlaps an existing one replaces the existing slot for the overlapping dates, in one transaction, and the result names the replaced slot. A partly covered slot is trimmed or split to the dates outside the new one. A fully covered slot is deleted, whether or not it has aired; its history rows keep their `clock_id` and lose only `grid_slot_id` (`ON DELETE SET NULL`).
 - **scheduled_items**: id, grid_slot_id, clock_id, track_id, planned_start_utc, planned_in_ms, planned_out_ms, truncated (bool, default false), source (`fill`, `rule`, `insert`, `hour_insert`, `reschedule`, `general`; v7-23), status (`planned`, `queued`, `aired`, `missed`, `replaced`), outage_id (nullable, FK to `broadcast_outages`), missed_at (timestamptz, nullable), reschedule_of_id (nullable, FK to `play_log`: the missed item this item replaces; set only when `source = reschedule`), created_at. The rolling track plan, covering 24 to 48 hours ahead.
@@ -153,7 +154,7 @@ Entities are stored in separate tables and linked by IDs. Foreign keys are enfor
   - `missed` means the item was planned but did not reach the air because of a broadcast outage (see §7.1).
   - `clock_insert_id` (nullable, FK to `clock_inserts`, `ON DELETE SET NULL`): the template insert of an `insert` item. `hour_insert_id` (nullable, FK to `hour_inserts`, `ON DELETE SET NULL`): the one-time insert of an `hour_insert` or `reschedule` item (v7-23).
 - **plan_hours**: hour_start_utc (primary key), clock_id (FK, `ON DELETE CASCADE`), clock_updated_at, grid_slot_id (nullable, `ON DELETE SET NULL`), seed, built_at. One row per built hour of the track plan (v7-11, `docs/phase-8-plan.md` §2). An hour is stale when the grid now assigns another clock or none, or the clock's `updated_at` changed (a change of a playlist's placement rule touches the `updated_at` of the clocks that use it); the seed makes a rebuild reproducible.
-- **hour_inserts**: id, hour_start_utc, track_id (FK, `ON DELETE RESTRICT`), missed_id (nullable, FK to `play_log`, `ON DELETE SET NULL`), placement (`start`, `end`, `fixed`), offset_ms (whole seconds; set only for `fixed`; v7-23, was fixed_minute), tolerance_ms, created_at. One-time inserts of a single hour: a track the manager adds to a planned hour (for example, today's news) or a missed item rescheduled into it (§7.1, §7.2). Every build of the hour places them; the clock template is not changed (v7-13, `docs/phase-10-plan.md` §2; v7-23).
+- **hour_inserts**: id, hour_start_utc, track_id (FK, `ON DELETE RESTRICT`), missed_id (nullable, FK to `play_log`, `ON DELETE SET NULL`), placement (`start`, `end`, `fixed`), offset_ms (whole seconds; set only for `fixed`; v7-23, was fixed_minute), tolerance_ms, rule_playlist_id (nullable, FK to `playlists`, `ON DELETE SET NULL`) and rule_origin_ms (nullable: the slot claim of a pinned rule track; `docs/track-pin-rule-plan.md`), created_at. One-time inserts of a single hour: a track the manager adds to a planned hour (for example, today's news) or a missed item rescheduled into it (§7.1, §7.2). Every build of the hour places them; the clock template is not changed (v7-13, `docs/phase-10-plan.md` §2; v7-23).
 - **broadcast_state**: one row (`id = 1`): state (`connected`, `reconnecting`, `unreachable`), since (the last change of the derived broadcast state), reason (nullable: the open outage's reason or component), updated_at. Written only when the state changes, so the panel's timer survives a restart of the backend (§7.1, v7-16, `docs/phase-16-plan.md`). An empty table means the state is unknown; `unknown` is never stored.
 - **backend_heartbeat**: one row, alive_at. Written by the outage detector every 30 seconds, so a restart can tell how long the backend was down (v7-13).
 - **broadcast_outages**: id, started_at (timestamptz, UTC), ended_at (timestamptz, UTC, nullable while the outage is open), detected_by (`icecast`, `liquidsoap_callback`, `liquidsoap_control`, `backend`), component (`icecast`, `liquidsoap`, `backend`, `network`), reason (short text, nullable), reconciled_at (timestamptz, nullable). One row per interruption. An open outage has `ended_at` null.
@@ -168,7 +169,7 @@ Entities are stored in separate tables and linked by IDs. Foreign keys are enfor
   - `ended_at` (timestamptz, nullable): set when the end of the track is recorded; null while it plays and for missed items. The first recorded end wins, because Liquidsoap may report the end of a track twice (v7-12, `docs/phase-9-plan.md` §2). A unique partial index on `scheduled_item_id` makes a repeated start a no-op.
   - `scheduled_item_id` and `resolved_item_id` are trace ids of `scheduled_items` rows, without a foreign key: those rows are deleted once they air or are missed (§4.1), so a foreign key would point at nothing. Aired rows are kept for 10 days (see §4.1). Missed rows are kept until resolved.
 - **settings**: key, value (JSONB), updated_at (timestamptz, UTC). Holds all backend settings edited in the admin panel, including the audio output profile (see §6.3 and §8.8), `fade_out_ms` (default 2500, allowed 2000 to 3000), and outage detection thresholds (see §6.3).
-- **Deletion and history.** A track, artist, or clock that is referenced by `play_log` or `scheduled_items` cannot be deleted (`ON DELETE RESTRICT`). The API refuses the request and says why. This keeps the played-tracks list and open missed items complete. The bulk delete of tracks (`POST /api/tracks/delete`) applies the same rules per track and lists the refused ones. A grid slot can be deleted; the history rows keep their other references and lose only `grid_slot_id`.
+- **Deletion and history.** A track or clock that is referenced by `play_log` or `scheduled_items`, and an artist referenced by `play_log`, cannot be deleted (`ON DELETE RESTRICT`). The API refuses the request and says why. This keeps the played-tracks list and open missed items complete. The bulk delete of tracks (`POST /api/tracks/delete`) applies the same rules per track and lists the refused ones. A grid slot can be deleted; the history rows keep their other references and lose only `grid_slot_id`.
 - **track_waveforms** (v7-22): track_id (primary key, FK `ON DELETE CASCADE`), file_checksum, bucket_ms, peaks (`bytea`: one signed byte each for the min and max of every bucket), duration_ms, created_at. The waveform of the cue editor, computed on the first request and valid while the track's `file_checksum` equals the stored one.
 - **operations**: id, kind, status (`running`, `completed`, `failed`), started_at, finished_at, error_message, result_summary (see §6.5).
 
@@ -223,7 +224,7 @@ All database access goes through a repository layer. Business logic never contai
 
 - REST over JSON for commands and data queries.
 - WebSocket for UI events from the backend to the panel: now playing, track progress, live on/off, Liquidsoap state, Icecast connection state, broadcast state, outage start and end, missed-item updates, error alerts, plan warnings, and the outcome of asynchronous operations (§6.5). The panel does not poll for these.
-- Error alerts are shown in the panel as a popup window with the error text. Errors are also written to the log file (see §10.1).
+- Error alerts are shown in the panel as a popup window with the error text. Errors are also written to the log (see §10.1).
 - All timestamps in the API are ISO 8601 in UTC (ending with `Z`).
 - Database structs are never sent to or accepted from the frontend directly.
 - Separate DTOs (request and response structs with `json` tags) are defined for each endpoint.
@@ -296,7 +297,8 @@ Everything the backend needs is managed by the manager in the Angular admin pane
 
 - Database connection (`DATABASE_URL` and credentials).
 - Secrets: `ICECAST_SOURCE_PASSWORD`, `LIQUIDSOAP_CONTROL_USER`, `LIQUIDSOAP_CONTROL_PASSWORD`.
-- Host paths: `MEDIA_ROOT`, `LOG_ROOT`, and `PLAYOUT_JOURNAL_ROOT`. They are needed by Docker bind mounts before the backend starts, so they are set once in the Compose `.env` file and never change.
+- Host paths: `MEDIA_ROOT` and `PLAYOUT_JOURNAL_ROOT`. They are needed by Docker bind mounts before the backend starts, so they are set once in the Compose `.env` file and never change.
+- Loki push address: `LOKI_URL` (`http://loki:3100` in containers; empty turns the push off, §10.1).
 
 **Managed in the UI (settings pages)**
 
@@ -306,9 +308,9 @@ Everything the backend needs is managed by the manager in the Angular admin pane
 - **Liquidsoap**: default music gain, the music level under live voice (`liquidsoap.duck_gain`, default 0.2; v7-15), fade lengths (including `fade_out_ms`, default 2500, allowed 2000 to 3000), harbor input port, control host and port, and the media directory as Liquidsoap sees it (`liquidsoap.media_root`, default `/media`).
 - **Playout**: the emergency playlist (§8.6), and how long before its start an hour's first items are pushed to Liquidsoap (`playout.prepush_minutes`, default 5). From then on the hour is frozen: it is not rebuilt, and one-time inserts cannot be added to it or removed from it.
 - **Air window** (v7-17): how many played items (`air.played_count`, default 10, allowed 1 to 50) and queued items (`air.queued_count`, default 9, allowed 0 to 50) `GET /api/air-window` returns around the item on air. A change applies to the next request.
-- **Rotation**: planning horizons (grid up to 30 days, track plan 24 to 48 hours), lookahead depth (2 to 3 tracks), the default start tolerance of a new insert (`rotation.default_fixed_tolerance_ms`, default 60 s), and the shortest gap that gets music (`rotation.min_gap_ms`, default 10 s). Separation values, duration tolerances, the filler settings, and the tolerance relaxation are removed in v7-23: separation is a play rule (§7.3).
+- **Rotation**: planning horizons (grid: `rotation.grid_horizon_days`, 1 to 183 days, default 183, about six months; track plan 24 to 48 hours), lookahead depth (2 to 3 tracks), the default start tolerance of a new insert (`rotation.default_fixed_tolerance_ms`, default 60 s), and the shortest gap that gets music (`rotation.min_gap_ms`, default 10 s). Separation values, duration tolerances, the filler settings, and the tolerance relaxation are removed in v7-23: separation is a play rule (§7.3).
 - **Outage detection**: heartbeat timeout for the Liquidsoap callback and control link (default 10 seconds), Icecast mount check interval (default 5 seconds), and the number of consecutive failed checks before an outage is opened (default 2).
-- **Retention**: play log days (default 10), application log days (default 10). Missed items are not subject to the play log days setting while they are open (see §4.1).
+- **Retention**: play log days (default 10). Missed items are not subject to the play log days setting while they are open (see §4.1). Log retention is not an admin setting: Loki keeps 10 days as deploy configuration (§10.4).
 - **Import** (v7-14; the inbox and library folder settings are removed in v7-18, the import registers files where they lie, §8.7): the broadcast standard of track files: target codec (`mp3`, `aac`, or `vorbis`; default `mp3`), bitrate (320 kbps), sample rate (44100 Hz), channels (2); the lowest acceptable bitrate of a lossy file (128 kbps), the loudness tolerance around `stream.loudness_target_lufs` (2 LU), and the highest true peak (−1 dBTP).
 - Any future backend setting follows the same pattern.
 
@@ -322,6 +324,7 @@ Playlist types are data in the `playlist_types` table, not entries in the `setti
 **Applying changes**
 
 - Each setting states whether it takes effect immediately (for example, music gain or log level) or needs a reconnect (for example, Icecast host or mount point). Changing the stream server briefly interrupts the stream.
+- A reconnect is not a restart (v7-24). When a stream output setting is saved, the backend sends the new output to Liquidsoap over the control link; the script replaces its Icecast output and leaves the playout sources and queues alone, so only the connection to the server is renewed (a gap of a few seconds, §8.8).
 - Changes that affect air are logged with a UTC timestamp (§12).
 
 **Secrets**
@@ -371,8 +374,10 @@ Clock endpoints (§6.0) take `playlists` and `inserts` (v7-23); the filler endpo
 | Method and path | Purpose |
 |-----------------|---------|
 | `GET /api/track-plan?from=&to=` | Built hours (at most 7 days) with their items |
-| `POST /api/track-plan/rebuild` | Body: `from`, `to`. Rebuilds the future hours of the range; returns `accepted` with an operation ID (`clock_build`) |
+| `POST /api/track-plan/rebuild` | Body: `from`, `to`. Rebuilds the future hours of the range and builds the current hour if it has no plan (§7); returns `accepted` with an operation ID (`clock_build`) |
 | `POST /api/track-plan/inserts` | v7-23. Body: `hour_start_utc`, `offset_ms`, optional `tolerance_ms`, `track_id`. Adds a one-time insert to a planned hour that is not frozen and rebuilds the hour; returns `accepted` with an operation ID (`hour_insert`). A track that cannot be placed whole fails the operation |
+| `POST /api/track-plan/pins` | `docs/track-pin-plan.md`. Body: `plan_item_id`, `offset_ms`, optional `tolerance_ms`. Pins a planned fill or rule track at a new time as a one-time insert of the same track and rebuilds the hour; `accepted` with an operation ID (`hour_insert`). Refused for a frozen hour (`hour_started`), an unknown item (`plan_item_not_found`), and an item that is not a planned fill or rule track, or a rule track with no playlist (`not_movable`). A track that cannot be placed fails the operation and nothing changes |
+| `PATCH /api/track-plan/inserts/{id}` | `docs/track-pin-plan.md`. Body: `offset_ms`, optional `tolerance_ms` (default: keep the current one). Moves a one-time insert with a fixed time inside its hour and rebuilds the hour; `accepted` with an operation ID (`hour_insert`). Refused for a frozen hour (`hour_started`), an unknown ID (`hour_insert_not_found`), and an insert without a fixed time (`not_movable`). An insert that cannot be placed fails the operation and keeps its old place |
 | `DELETE /api/track-plan/inserts/{id}` | v7-23. Removes a one-time insert and rebuilds the hour; `accepted` with an operation ID (`hour_insert`). Refused for a frozen hour; removing a rescheduled missed item's insert opens the missed item again |
 
 **Endpoints added in v7-12 (playout, `docs/phase-9-plan.md` §4)**
@@ -381,7 +386,7 @@ Clock endpoints (§6.0) take `playlists` and `inserts` (v7-23); the filler endpo
 |-----------------|---------|
 | `POST /api/playout/callback` | Called by Liquidsoap: track `start` and `end`, and the Icecast output state (§8.3). A started plan item moves to `play_log`; repeated events change nothing |
 | `GET /api/playout/emergency/next` | Called by Liquidsoap: the next track of the emergency playlist as a request (`text/plain`), or 204 (§8.2, §8.6) |
-| `GET /api/playout/status` | Control link, Icecast output, now playing, items waiting in Liquidsoap's queues, music gain |
+| `GET /api/playout/status` | Control link, Icecast output, now playing, items waiting in Liquidsoap's queues, music gain, whether the safety tone is on air (`safety_on_air`, `safety_since`) |
 | `PUT /api/playout/music-gain` | Body: `gain` (0 to 1). Sets the live music gain (§8.5); refused with `liquidsoap_unavailable` when the control link is down |
 
 **Implemented in v7-13 (`docs/phase-10-plan.md` §4).** The v7-6 endpoints above are implemented with these details: `GET /api/play-history` takes `from` and `to` (at most 31 days), an optional `status`, and is keyset paginated (`limit`, `cursor`, `next_cursor`); `GET /api/outages` takes at most 7 days; reschedule refuses the checks that need no build per field (422) and a resolved item with 409 `missed_item_resolved`, and its operation fails when the track breaks a rule at its place or does not fit whole. `POST /api/playout/callback` also takes a `heartbeat` event, sent by Liquidsoap every 5 seconds and not journaled.
@@ -424,8 +429,9 @@ Track responses carry the analysis columns, `quality_issues`, and `fixes` (the t
 | Method and path | Purpose |
 |-----------------|---------|
 | `GET /api/import/folders` | Every folder under the media root, nested ones included, in path order (at most 500, `more`), with `audio_files` and `new_files` in the folder and its subfolders, and the same counts for the whole root. Hidden folders and symbolic links are skipped. The counts compare paths only, without reading a file |
-| `GET /api/import/files?folder=` | The files of a folder and its subfolders (at most 2,000, `more`): `path`, `size`, `modified_at`, `status` (`new`, `in_library` or `original` with `track_id`, `not_audio`). A folder that is not a clean relative path, is hidden, or does not exist is refused per field (`folder`, `invalid`) |
-| `POST /api/import` | Body: `folder` (absent or empty: the media root), `type_id`, `playlist_ids`, `artist_id` (an existing artist; it wins over the artist tag and the file name). Every audio file of the folder that is not a track yet becomes one where it lies; nothing is moved, and existing tracks are not changed. Returns `accepted` (`import`); the summary starts with the folder |
+| `GET /api/import/files?folder=` | The files of a folder and its subfolders (at most 2,000, `more`): `path`, `size`, `modified_at`, `status` (`new`, `in_library` or `original` with `track_id`, `not_audio`). For `in_library` and `original`, `track`: the track of `track_id` from the database (`id`, `title`, `artist`, `duration_ms`, `air_duration_ms`, `format`, `codec`, `bitrate`, `sample_rate`, `channels`, `quality_issues`, `reviewed_at`; for `original` the facts of the library copy, not of this file). For `new`, `name_title` and `name_artist` (null when none): the import's file-name rule, its fallback after the tags. No file is read; the tracks come from one path-range query, read only by this listing (the folder counts and the import read the paths only). A folder that is not a clean relative path, is hidden, or does not exist is refused per field (`folder`, `invalid`) (v7-18, extended by `docs/import-file-details-plan.md`) |
+| `GET /api/import/file-info?path=` | One file probed with ffprobe (headers only, no decode): `path`, `size`, `modified_at`, `duration_ms`, `format`, `codec`, `bitrate`, `sample_rate`, `channels`, `tags` (`title`, `artist`, null each), `title` and `title_source` (`tag`, `file_name`), `artist` (null) and `artist_source` (`tag`, `file_name`, `none`) as the import would set them (the same function; the request's `artist_id` overrides the artist), and `issues`: the quality issues the probe shows (`format`, `sample_rate`, `channels`, `low_bitrate`; loudness and true peak need the analysis). Synchronous in the request, at most two probes at a time; not a media operation, so it neither waits for nor blocks one; nothing is stored or cached. Refusals: per field `path` `invalid` (not clean, absolute, hidden) or `not_audio` (an import skips it by its name); 404 `import_file_not_found`; 422 `probe_failed` (not readable as audio, no duration, timeout; logged at WARN, no alert); 503 `media_tools_unavailable` without ffprobe (`docs/import-file-details-plan.md`) |
+| `POST /api/import` | Body: `folder` (absent or empty: the media root), `type_id`, `playlist_ids`, `artist_id` (an existing artist; it wins over the artist tag and the file name). Every audio file of the folder that is not a track yet becomes one where it lies; nothing is moved, and existing tracks are not changed. Returns `accepted` (`import`); the summary starts with the folder and its import counts, followed by `; analysis: ...`, the counts of the analysis of the new tracks that runs alongside the import |
 
 `GET /api/import/inbox` is removed. The title of a new track is its title tag, else the title part of the file name; its artist is `artist_id`, else the artist tag, else the artist part of the file name (`Artist - Title` with exactly one hyphen, en dash, or em dash), else none.
 
@@ -439,7 +445,9 @@ An analysis or transcode that reaches a track deleted after it started counts it
 
 **Track list pages and sort (v7-20, `docs/phase-20-plan.md` §2)**
 
-`GET /api/tracks` also takes `sort` (`title` default, `artist`, `type`, `duration`, `format`, `quality`), `order` (`asc` default, `desc`), and `offset` (0 to 1,000,000), and its response carries `total`, the number of tracks matching the filters on every page. PostgreSQL sorts the whole filtered set; tracks without the value (no artist, no duration, no format, never analysed) are last in both orders, and ties are ordered by title and ID ascending. The `quality` order is: no issues, with issues (more issues first), never analysed. An offset past the end returns no items and the correct `total`. `cursor` and `next_cursor` work only in the default order (`title`, `asc`) and without `offset`; any other combination is a 422 on `query.cursor`.
+`GET /api/tracks` also takes `sort` (`title` default, `artist`, `type`, `duration`, `format`, `quality`), `order` (`asc` default, `desc`), and `offset` (0 to 1,000,000), and its response carries `total`, the number of tracks matching the filters on every page. PostgreSQL sorts the whole filtered set; tracks without the value (no artist, no duration, no format, never analysed) are last in both orders, and ties are ordered by title and ID ascending. The `quality` order is: no issues, with issues (more issues first), never analysed. An offset past the end returns no items and the correct `total`. `cursor` and `next_cursor` work only in the default order (`title`, `asc`) and without `offset`; any other combination is a 422 on `query.cursor`. The `duration` order uses the on-air length (`air_duration_ms`).
+
+`GET /api/tracks/stats` takes the filters of `GET /api/tracks` (`type_id`, `artist_id`, `playlist_id`, `q`, `quality`, `reviewed`, `in_plan`, `in_playlist`) and returns, for the matching tracks, `total`, `reviewed`, `with_issues` (the condition of the `quality=issues` filter), `unanalysed`, and `air_duration_ms` (the sum of the on-air lengths; a track without a duration adds nothing). Without filters the figures describe the whole library (`docs/track-stats-plan.md`).
 
 **Endpoints added in v7-21 (reviewed mark and bulk rename, `docs/phase-21-plan.md` §2)**
 
@@ -460,6 +468,17 @@ An analysis or transcode that reaches a track deleted after it started counts it
 Track responses carry the cue (`cue_in_ms`, `cue_out_ms`, `fade_in_ms`, `fade_out_ms`, `air_duration_ms`) and the usage marks `next_planned_at` (the earliest planned or queued item) and `playout_state` (`on_air`, `queued`, or absent). `GET /api/tracks` also takes `in_plan` and `in_playlist` (`true` or `false`) and the sort key `next_planned_at` (tracks not in the plan last in both orders). `PUT /api/tracks/{id}` does not take the cue and keeps it. Plan items, played tracks, missed items, the queued items of the playout status carry `planned_in_ms` next to `planned_out_ms`, and now playing carries `in_ms` next to `out_ms`. The settings `liquidsoap.cue_fade_in_ms` (1000) and `liquidsoap.cue_fade_out_ms` (2000), 0 to 5000, are the fades the panel's editor proposes; the backend never applies them on its own.
 
 **Title rule** (create, update, bulk rename, import): the title is trimmed and runs of white space become one space; control characters (line breaks, tabs) are refused on the API (field `title`, code `invalid_characters`) and removed on import; 1 to 500 characters after cleaning. A title saved on the API reaches the air with the requests pushed after the save (§8.1); items already in Liquidsoap's queues keep the title they were pushed with.
+
+**Artists (`docs/artists-paging-plan.md`)**
+
+| Method and path | Purpose |
+|-----------------|---------|
+| `GET /api/artists` | Artists with `track_count`. Takes `q` (case-insensitive "name contains", at most 200 characters), `sort` (`name` default, `track_count`), `order` (`asc` default, `desc`), `offset` (0 to 1,000,000), and `limit` (1 to 500, default 100); the response carries `items` and `total` (the artists matching `q`, the same on every page). Ties are ordered by name, then ID, ascending. No cursor |
+| `GET /api/artists/{id}` | One artist; 404 for an unknown ID |
+| `PUT /api/artists/{id}` | Renames the artist |
+| `DELETE /api/artists/{id}` | Refused with 409 `artist_in_use` and `used_by` (the tracks) while tracks refer to the artist, and with 409 `artist_has_history` for an artist with play history and no tracks. Nothing cascades: tracks are never deleted or left without their artist by this call. Synchronous |
+
+The panel disables Delete for an artist with tracks and links the track count to the library filtered by `artist_id`. The artist picker searches on the server (`q`, `limit=50`) and reads the selected artist with `GET /api/artists/{id}`.
 
 **Endpoints added in v7-8 (play rules and track preview)**
 
@@ -482,7 +501,7 @@ Some backend operations take time and run asynchronously. Examples: building a t
 - When the operation finishes, the backend sends exactly one terminal event over the WebSocket hub: either a success event or a failure event. The event carries the operation ID.
 - Long operations may also send progress events (for example, "12 of 40 files analysed"). Progress is optional. The terminal event is mandatory.
 - Event types are named `<operation>.completed` for success and `<operation>.failed` for failure (so the plan job ends with `track_plan.completed`, not `track_plan.built`), for example `track_plan.completed`, `track_plan.failed`, `clock_build.completed`, `clock_build.failed`, `import.completed`, `import.failed`, `missed_items.completed`, `missed_items.failed`, `reschedule.completed`, `reschedule.failed`, `hour_insert.completed`, `hour_insert.failed` (v7-23), `playout_reconcile.completed`, `playout_reconcile.failed`, `analyse.completed`, `transcode.completed` (and their `.failed` and `.progress` events).
-- A failure event contains a short error message, the component that failed (§10.1), and the UTC time. The same error is written to the log file (§10.1) and shown in the panel as an error popup (§6, §10.1).
+- A failure event contains a short error message, the component that failed (§10.1), and the UTC time. The same error is written to the log (§10.1) and shown in the panel as an error popup (§6, §10.1).
 - A success event contains the operation ID, a short result summary, and the UTC time, so the panel can refresh the affected view.
 - The event schemas are part of the OpenAPI contract (§6.4). Each event type is a named schema, so the TypeScript client has typed handlers for every event.
 
@@ -497,13 +516,14 @@ Some backend operations take time and run asynchronously. Examples: building a t
 **Playout events (from Liquidsoap's track callbacks; not sent for journal replay)**
 
 - `playout.now_playing`: a track has started on air: the plan item (absent for an emergency track), the track, `started_at`, `out_ms`, `truncated`.
+- `playout.safety`: the safety tone went on or off air: `on_air`, and `since` while it is on air. Sent only on a change.
 - `playout.track_ended`: a track has left the air and its end is in the play log: the plan item (absent for an emergency track), the track, `source`, the final `status` (`aired` or `truncated`), `started_at`, `ended_at`, `actual_duration_ms`. Sent after the write, once per item (a repeated end sends nothing). The panel clears its now playing unless a newer track has started, and reloads the air window (v7-17).
 
 **Operation tracking**
 
 - Each asynchronous operation has a row in an `operations` table: id, kind, status (`running`, `completed`, `failed`), started_at, finished_at, error_message, result_summary. The table is the source of truth for the operation state. A panel that reconnects can read it through the REST API to catch up on events it missed.
 - Events are not the only record. If the WebSocket connection is down when an event is sent, the operation still ends in its stored state, and the panel reads that state on reconnect.
-- The `operations` table follows the same retention as the logs (10 days).
+- The `operations` table keeps 10 days, a fixed retention in code (not an admin setting).
 
 **Examples**
 
@@ -532,7 +552,7 @@ The manager and the operator can listen to any track in the panel, without leavi
 
 The engine works on three horizons, each with its own job.
 
-**Grid (up to 30 days).** The grid is read, not computed. It says which clock plays in each hour. Changing the grid marks affected planned items as stale (see "Grid and clock changes" below).
+**Grid (up to 183 days).** The grid is read, not computed. It says which clock plays in each hour. Changing the grid marks affected planned items as stale (see "Grid and clock changes" below).
 
 **Track plan (rolling 24 to 48 hours).** Every hour, Go extends the plan so that it always covers the configured window. For each upcoming hour with a clock, the hour is built from the clock's playlists and inserts and the hour's one-time inserts (v7-23, `docs/phase-23-plan.md` §3.3):
 
@@ -558,7 +578,7 @@ A rule slot or a playlist insert with no allowed track is skipped with a warning
 
 The engine is deterministic for a given input and seed, which makes it testable.
 
-**Implementation decisions (v7-11, v7-23).** `docs/phase-8-plan.md` §2 recorded the element engine; `docs/phase-23-plan.md` §3.3 replaces it with the playlist and insert build above. Kept from v7-11: music only in gaps of at least `rotation.min_gap_ms`; hours that have started are never rebuilt; the seed is the hour start. Since v7-22 (`docs/phase-22-plan.md`) every fit, reschedule, and the crossing rule use the on-air length of a track (between its cue points); a plan item records the cut it was planned with (`planned_in_ms` is the cue in, a crossing item is cut at `cue_in + time left`), and keeps it when the track's cue changes later; a cue change rebuilds the future hours that hold a planned item of the track. Besides the operation events, the planner sends `track_plan.warning` (the warnings of one built hour).
+**Implementation decisions (v7-11, v7-23).** `docs/phase-8-plan.md` §2 recorded the element engine; `docs/phase-23-plan.md` §3.3 replaces it with the playlist and insert build above. Kept from v7-11: music only in gaps of at least `rotation.min_gap_ms`; hours that have started are never rebuilt; the seed is the hour start. A grid hour that has started and has no stored plan is built once by the sync, for what is left of the hour, and only if at least 2 minutes remain (`docs/started-hour-build-plan.md`, 2026-11-10); its start offset is not stored, so the seed alone does not reproduce such an hour. Since v7-22 (`docs/phase-22-plan.md`) every fit, reschedule, and the crossing rule use the on-air length of a track (between its cue points); a plan item records the cut it was planned with (`planned_in_ms` is the cue in, a crossing item is cut at `cue_in + time left`), and keeps it when the track's cue changes later; a cue change rebuilds the future hours that hold a planned item of the track. Besides the operation events, the planner sends `track_plan.warning` (the warnings of one built hour).
 
 ### 7.1 Broadcast Outages and Missed Items
 
@@ -567,10 +587,10 @@ An outage is a period when the station's audio did not reach listeners, for exam
 **Outage detection**
 
 - The outage detector runs in the backend and watches three signals:
-  1. **Icecast state**: the backend checks the mount point on the Icecast server at the configured interval (§6.3). Liquidsoap also reports its output connection state through its callbacks (§8.3).
+  1. **Icecast state**: the backend checks the mount point on the Icecast server at the configured interval (§6.3), by reading its `/status-json.xsl` over HTTP, or HTTPS when the server uses TLS (§8.8). Liquidsoap also reports its output connection state through its callbacks (§8.3).
   2. **Liquidsoap callbacks**: track start and end events. If no callback arrives within the heartbeat timeout while the station should be on air, the detector treats the playout as stalled.
   3. **Liquidsoap control link**: the backend's connection to the control interface (§8.1). Loss of this link for longer than the heartbeat timeout is treated as an outage while planned items are due: Liquidsoap keeps streaming (its queue, then the emergency source), but planned items cannot be pushed, so they become missed and the manager can reschedule them (decided 2026-10-14, v7-13).
-- Liquidsoap sends a heartbeat callback every 5 seconds, so a stalled playout is told apart from a long track (v7-13).
+- Liquidsoap sends a heartbeat callback every 5 seconds, so a stalled playout is told apart from a long track (v7-13). The heartbeat also carries the optional `safety_on_air`: true when the source before the safety tone is not ready. The backend keeps this in memory: two true reports in a row (about 10 seconds) turn the state on, so a short gap between tracks is not reported, one false report turns it off, a heartbeat without the field changes nothing, and the state is reset when the heartbeat is silent beyond the timeout.
 - An outage opens after the configured number of consecutive failed checks, so a single dropped request does not create a false outage. It is written to `broadcast_outages` with `started_at`, `detected_by`, and `component`.
 - The outage closes when all signals report normal operation again. `ended_at` is set and `broadcast_outage.ended` is sent (§6.5).
 - Detection must not block playout. It runs in its own goroutine and only writes state.
@@ -649,6 +669,8 @@ A soft anchor is reached by a best-fit fill track, never by cutting. A rule trac
 - **Conflict.** An insert that cannot start inside its window because the chain before it runs past it is skipped (template insert, with a warning) or refused (one-time insert: the add operation fails; a later rebuild drops it with a warning and opens a rescheduled missed item again).
 - **Replacement.** A one-time insert at exactly the offset of a template insert replaces it for that hour, with a warning.
 - A one-time insert is checked like any track (§7.3) and plays whole: it is never cut.
+- **Pins.** Dragging a planned fill or rule track to a new time stores a one-time insert of that track, so a pin lasts until the end of the hour and every rebuild of the hour keeps it. Removing the insert unpins the track and rebuilds the hour, and the freed place may get another track. The tracks of an hour's one-time inserts are not drawn again by the fill of that hour, even where no play rule covers them (`docs/track-pin-plan.md`).
+- **Rule pins.** A pinned rule track claims one slot of its rule in that hour (`rule_playlist_id`, `rule_origin_ms`), so the hour keeps the same number of rule tracks. The other slots of a `spread` keep their windows; a `start` or `end` block is one track shorter. Rule draws avoid the pinned track unless it is the only one allowed. A pin the builder refuses gives its slot back in the same build. A claim that no longer has a slot (the playlist left the clock or was deleted, or the slot is already taken) claims nothing and raises the warning `pin_claim_stale`, so the hour may have one track more. A remaining slot that collides with the pin can still be skipped with `rule_slot_skipped` (`docs/track-pin-rule-plan.md`).
 
 **Validation on save.** Refused per field: no fill playlist; a playlist twice; `clock_count` missing for `spread` or set for another rule; a share on a non-fill row, out of 1 to 100, or set on some fill rows only; an insert offset outside the hour, not in whole seconds, or used twice; a tolerance out of 0 to 600 s; an insert with neither or both of track and playlist; unknown references. A refused save does not change the template.
 
@@ -730,10 +752,10 @@ Liquidsoap performs the fade itself, so control-path latency does not affect it.
 ### 8.6 Fallback
 
 - Liquidsoap uses `fallback` so that if live voice drops, automation takes over.
-- If the automation source fails, a safety playlist or silence is played.
+- If the automation source fails, a safety source is played (a quiet tone in the development script). The panel header warns on every page while the safety tone or an emergency track is on air (§7.1 for how the tone is reported).
 - Go is informed of state changes but is not required for the fallback to work.
 - Items already in `scheduled_items` with status `planned` remain valid during a Go outage. Liquidsoap's queue keeps playing, and the planned tracks that were already pushed are not affected. Their outcome is recorded by the journal and reconciled later (§7.1).
-- The emergency playlist is a set of tracks chosen by the operator in settings. It plays when the pool and the plan are both empty. Tracks played from the emergency playlist are logged as `source = emergency` and are not counted as missed items.
+- The emergency playlist is a set of tracks chosen by the operator in settings or with the checkbox on the playlist page; both write `playout.emergency_playlist_id`. It plays when the pool and the plan are both empty. The current emergency playlist cannot be deleted: another one must be chosen, or the setting cleared, first (`docs/emergency-playlist-delete-guard-plan.md`). Tracks played from the emergency playlist are logged as `source = emergency` and are not counted as missed items.
 
 ### 8.7 Media files (not stored in Docker)
 
@@ -750,14 +772,22 @@ Audio files are about 800 files and must not be copied into Docker images or vol
 
 All Icecast and output parameters are settings, not code, so they can be changed per server without a rebuild. The manager edits them in the admin panel (§6.3). Fields include:
 
-- Icecast host, port, mount point, admin and source credentials (source password from environment, not committed);
+- Icecast host, port, mount point, whether the server uses TLS, admin and source credentials (source password from environment, not committed);
 - codec (for example MP3, AAC, or Ogg Vorbis), bitrate, sample rate, channels;
 - loudness target and limiter settings used by Liquidsoap;
 - stream name, description, and genre metadata;
 - the charset of the mount. Icecast 2.4 stores and serves the metadata of an MP3 stream in the mount's `<charset>`, ISO-8859-1 by default, so a title in Cyrillic or Armenian shows as `*` until the mount has `<charset>UTF-8</charset>`; Liquidsoap sends UTF-8 (v7-21, `docs/phase-21-plan.md` §7). This is Icecast configuration, not a backend setting;
 - HLS output on or off, if used later.
 
-The Docker Icecast service is a test server. Its connection is entered in the admin panel like any other setting, and switching to the production server is a settings change, not a code or file change. Only the Icecast source password stays in the environment.
+The Docker Icecast service is a test server of the dev stack. Production streams to an external Icecast server; switching servers is a settings change, not a code or file change. Only the Icecast source password stays in the environment.
+
+**Applying output settings at runtime (v7-24, deploy plan §5.2).** The script registers a control command that takes the output as JSON (host, port, mount, TLS, codec, bitrate, sample rate, channels, name, description, genre). If it differs from the running output, the script shuts the Icecast output down and creates a new one on the same source; the queues, the fallback, and the journal are not touched. The backend sends it when a stream setting is saved and on every new control connection; at startup Liquidsoap fetches it from the backend (`GET /api/playout/output`), falling back to the last applied output and then to the defaults. Checked with `savonet/liquidsoap:v2.4.6`: bitrate, sample rate, channels, mount, and codec (MP3, Vorbis, AAC) all change at runtime; on the same mount the stream pauses about 4 s, because Icecast releases the mount only after the old connection closes. The MP3 encoder needs its stereo flag as a literal, so the script has one encoder branch per codec and channel count, and the script is tested by running it, not only by `liquidsoap --check`.
+
+**TLS.** Liquidsoap 2.4.6 streams to an Icecast server over TLS with `transport=http.transport.ssl()` (checked against a TLS proxy in front of the test Icecast). The backend's mount check reads the status page over HTTPS when TLS is on.
+
+**Metadata charset (checked 2026-11-12, Icecast 2.4.4).** Liquidsoap already sends the `charset` parameter with every metadata update (its `encoding`, UTF-8 by default), and Icecast converts the title from that charset to the mount's charset, so with the default ISO-8859-1 mount a Cyrillic or Armenian title becomes `*` for listeners and on the status page. The charset parameter alone cannot fix it. Declaring `encoding="ISO-8859-1"` makes Icecast store the UTF-8 bytes unchanged: listeners' players then show the title correctly, but Icecast's own status page shows it garbled. The correct fix stays `<charset>UTF-8</charset>` on the mount, set by the server owner. The script sends UTF-8 (the default `encoding`); until the owner changes the mount, non-Latin titles show as `*`, which is accepted. `encoding="ISO-8859-1"` is a documented fallback only.
+
+**Production server (v7-24).** The station streams to `https://listen.teploe.net:8001/atlantida` (Icecast 2.4.4). Port 8001 accepts TLS only; listeners are also served over plain HTTP on port 8100. The server already relays other mounts in MP3 and AAC. The first install proposes MP3, 160 kbps, 44100 Hz, stereo, as the current stream on the mount uses; it stays a panel setting. The switch from the current source on the mount is a manual step (deploy plan runbook).
 
 ### 8.9 Control interface security
 
@@ -779,27 +809,30 @@ Services in a single `docker-compose.yml` (kept in `radio-atlantida-deploy`):
 - `backend`: Go backend (image `radio-atlantida-backend`, built from `radio-atlantida-backend`).
 - `db`: PostgreSQL with a named volume for database data.
 - `liquidsoap`: Liquidsoap image (Linux), media directory mounted read-only, and a bind mount of `PLAYOUT_JOURNAL_ROOT` for the playout journal (see §7.1).
-- `icecast`: test stream server with default configuration.
+- `icecast`: test stream server with default configuration, in the dev stack only. The production compose has no Icecast container: it streams to an external server (§8.8, v7-24).
 - `frontend`: Angular build served by a static server (image `radio-atlantida-frontend`, built from `radio-atlantida-frontend`).
 - `proxy` (optional): reverse proxy for the panel and API.
-- `grafana` (optional, `monitoring` switch): a live view of the database (§10.3) and log search (§10.4) for the operator. With it, `grafana-role`: a one-shot job that keeps the read-only database role of Grafana in step with `.env` and exits; `loki`: log storage; `alloy`: the collector that reads the log and journal files into Loki.
+- `grafana` (optional, `monitoring` switch): a live view of the database (§10.3) and log search (§10.4) for the operator. With it, `grafana-role`: a one-shot job that keeps the read-only database role of Grafana in step with `.env` and exits.
+- `loki` (core service): log storage. The backend pushes its application log to it; the Logs page of the panel and Grafana read it (§10.4).
+- `alloy` (core service): the collector that reads the playout journal file into Loki (§10.4).
 
 Guidelines:
 
 - Each service has its own image; no secrets are baked into images.
 - Configuration comes from environment variables and `.env` files that are not committed, limited to the database connection, secrets, and host paths. All other settings are edited in the admin panel (see §6.3).
 - Media files are never inside a container image or a named volume (see §8.7).
-- Health checks are defined for `db`, `backend`, `liquidsoap`, `grafana`, and `alloy`. `loki` has none: its image is distroless (only the `loki` binary, no shell or HTTP client) and `loki` has no health subcommand. Nothing waits for it to be healthy: Alloy retries its pushes, and Grafana's data source answers once Loki is ready.
-- The log directory (`LOG_ROOT`) is a host bind mount writable by `backend`. Logs are never kept only inside a container (see §10.1).
+- Health checks are defined for `db`, `backend`, `frontend`, `liquidsoap`, `grafana`, and `alloy`. The one-shot jobs `migrate` and `grafana-role` disable the server health check of their images. `loki` has none: its image is distroless (only the `loki` binary, no shell or HTTP client) and `loki` has no health subcommand. Nothing waits for it to be healthy: the backend keeps writing stdout and retries its pushes, Alloy retries its pushes, and Grafana's data source answers once Loki is ready.
+- The backend writes no log files and has no log directory. Its log goes to stdout and is pushed to Loki (§10.1), so it does not depend on a file inside a container.
 - The playout journal directory (`PLAYOUT_JOURNAL_ROOT`) is on the host. `liquidsoap` writes to it read-write, and `backend` mounts the same directory read-only for reconciliation (§7.1). It survives container recreation and is included in the backup set (§10).
-- Services communicate over an internal Docker network. Only the panel port, the Icecast listener port, and the Grafana port are published to the host. The Grafana port is always bound to `127.0.0.1` (§10.3); `loki` and `alloy` are not published.
+- Services communicate over an internal Docker network. In production only the panel port, the live voice UDP port of the backend (8189/udp, §8.4), and the Grafana port are published (§10, §10.3; v7-24). The panel and Grafana are bound to `127.0.0.1`; the UDP port is bound to `127.0.0.1` in WSL's mirrored networking mode and to the WSL VM's own address space in NAT mode, where the VM is reachable from the Windows host only (§9.1). No listener port is published: listeners connect to the external Icecast server. `alloy` is not published. `loki` is not published in production; in development it is bound to `127.0.0.1:3100` (§10.4).
 
 ### 9.1 Development and runtime platforms
 
 - **Development**: macOS. Docker Desktop runs the Linux containers.
-- **Runtime**: Windows 10 or 11 PC on SSD storage, running Docker Desktop. The Docker engine inside is Linux (WSL2 backend), so all containers are Linux containers.
-- Because development is on macOS and runtime is on Windows, the `MEDIA_ROOT`, `LOG_ROOT`, and `PLAYOUT_JOURNAL_ROOT` paths are set per machine in `.env`. Paths in the database stay relative (§8.7).
-- Bind-mounted files from the Windows filesystem are accessed through the WSL2 layer. Read performance is adequate for playout.
+- **Runtime** (v7-24, deploy plan §6): a Windows 10 PC (21H2, build 19044, or later, with the Microsoft Store WSL) on SSD storage; Windows 11 works the same way and is recommended later. Windows 10 reached end of support on 14 October 2025: the station's machine is most likely Windows 10 Home without paid Extended Security Updates, so it gets no more security fixes (and no update-driven reboots); the station accepts this for now because it exposes no inbound port, and the machine is not used for email or browsing. The installer sets the active hours over the broadcast day and uses no edition-specific update policy. Docker Engine and the Compose plugin run inside a dedicated WSL2 distribution (`radio-atlantida`, Ubuntu LTS, systemd enabled), installed by `install.bat`; Docker Desktop is not used. A Windows scheduled task of a dedicated local account starts the distribution at boot without a sign-in and keeps it running; systemd starts Docker, and Docker restarts the containers (`restart: unless-stopped`). The network mode follows the Windows build. On Windows 10 (NAT mode), WSL's localhost forwarding makes the panel and Grafana, published on `127.0.0.1` inside WSL, reachable at `127.0.0.1` on Windows; it does not forward UDP, so the live voice port is published in the VM and the browser reaches it at the VM's address, which changes at every boot: a boot unit writes it to `LIVE_PUBLIC_IPS` and recreates the backend when it changed. On Windows 11 22H2 or later the installer chooses mirrored mode, where `127.0.0.1` works for TCP and UDP and `LIVE_PUBLIC_IPS` is `127.0.0.1`. The panel is always opened at `http://127.0.0.1`, a secure context, so the microphone works without HTTPS.
+- Because development is on macOS and runtime is on Windows, the `MEDIA_ROOT` and `PLAYOUT_JOURNAL_ROOT` paths are set per machine in `.env`. Paths in the database stay relative (§8.7).
+- The media directory is the station's existing Windows folder of tracks, seen in WSL through the drive mount (`/mnt/d/...`) with a fixed owner, group, and group write, so the backend can write fixed files and Liquidsoap reads them; the import works in place and nothing watches the folder (§8.7), so the drive mount's slower access and missing file notifications do not matter for it. A Defender exclusion keeps scans away from files on air. The playout journal, the backups, and the deploy repository live on the distribution's own ext4 file system (`/srv/radio/...`, `/opt/radio-atlantida/deploy`) for speed, real `fsync`, and permissions.
+- The database is a named volume of that Docker Engine (on the distribution's disk), never a bind mount from the Windows filesystem. Data moves one way only, production to development, by restoring a dump; there is no replication (v7-24).
 - File paths and line endings are checked in the build pipeline because they differ between macOS and Windows.
 
 ### 9.2 Deployment and Updates
@@ -809,91 +842,97 @@ The production machine runs the stack from the **radio-atlantida-deploy** reposi
 **Repositories and images**
 
 - `radio-atlantida-backend` (Go) and `radio-atlantida-frontend` (Angular) are built by CI (GitHub Actions) on tagged releases and pushed to GitHub Container Registry as `ghcr.io/astronin/radio-atlantida-backend:<tag>` and `ghcr.io/astronin/radio-atlantida-frontend:<tag>`.
-- Both images are built from the same tag, so a release is one version number for the whole system. The OpenAPI specification and the generated TypeScript client are part of that same tag (§6.4).
+- Each image has its own release tag (v7-24). Each tag is one multi-arch manifest list for `linux/amd64` (the production target) and `linux/arm64` (the developer's Mac), so Docker pulls the right architecture; the deploy repository pins the manifest list's digest. A frontend runs against any backend of the same MAJOR.MINOR version; the frontend client is generated from the OpenAPI specification of a backend release of that MAJOR.MINOR (§6.4).
 - Images are private. The production machine logs in with a read-only token (`read:packages`) stored in `.env`.
-- **Implemented in Phase 13 (`docs/phase-13-plan.md`).** The Git tag is `vX.Y.Z`; the image tag and the version are `X.Y.Z` (no `latest`, never overwritten). The release workflow runs the full CI, builds `linux/amd64`, and attaches the `openapi.json` produced by the shipped image to the GitHub release `vX.Y.Z`; the frontend copies it into its snapshot. `backend version` prints the version.
+- **Implemented in Phase 13 (`docs/phase-13-plan.md`).** The Git tag is `vX.Y.Z`; the image tag and the version are `X.Y.Z` (no `latest`, never overwritten). The release workflow runs the full CI, builds `linux/amd64` (multi-arch with `linux/arm64` from v7-24), and attaches the `openapi.json` produced by the shipped image to the GitHub release `vX.Y.Z`; the frontend copies it into its snapshot. `backend version` prints the version.
 
 **Deploy repository contents (`radio-atlantida-deploy`)**
 
-- `docker-compose.yml`: services `backend`, `migrate`, `db`, `liquidsoap`, `icecast`, `frontend`, and the monitoring services `grafana-role`, `grafana`, `loki`, and `alloy` (§10.3, §10.4).
+- `docker-compose.yml`: services `backend`, `migrate`, `db`, `liquidsoap`, `frontend`, the core services `loki` and `alloy` (§10.4), and the monitoring services `grafana-role` and `grafana` (§10.3). No `icecast` (v7-24).
 - `.env.example`: the template for the machine's `.env`. The real `.env` is not committed.
-- `IMAGE_TAG`: the release tag in use, for example `1.4.2`.
+- `release.env`: the release to install, `BACKEND_TAG`, `FRONTEND_TAG`, and their image digests (v7-24).
 - `update.bat`: the entry point the manager runs on double-click or from a terminal.
-- `update.ps1`: the update logic in PowerShell, called by `update.bat`.
-- `config/`: Liquidsoap script, Icecast configuration, Grafana provisioning (role script, data sources, dashboards; §10.3, §10.4), and the Loki and Alloy configuration (§10.4).
+- `install.bat` → `install.ps1`: the one-time host setup (WSL2, the distribution, Docker Engine, the boot task, host settings) and the first configuration of the stack (v7-24).
+- `bin/radioctl`: the update logic, a bash script that runs inside the distribution; `update.bat` only calls it through `wsl.exe`.
+- `config/`: the production Liquidsoap script, Grafana provisioning (role script, data sources, dashboards; §10.3, §10.4), and the Loki and Alloy configuration (§10.4), copies of the backend's `dev/` files at the pinned tag.
 - `backups/`: database dumps, not committed.
 - `logs/`: update run logs, not committed.
 - `README.md`: a short description of the steps above.
 
-The Compose file references images by tag, for example `image: ghcr.io/astronin/radio-atlantida-backend:${IMAGE_TAG}`.
+The Compose file references images by tag and digest, for example `image: ghcr.io/astronin/radio-atlantida-backend:${BACKEND_TAG}@${BACKEND_DIGEST}`.
 
 **Migrations**
 
 - The `radio-atlantida-backend` image contains the migration files (from `radio-atlantida-backend`) and the `migrate` subcommand (golang-migrate library). The same image is used for both the server and the migration.
-- The Compose service `migrate` runs `backend migrate up` once and exits. The `backend` service starts only after it completes successfully (`depends_on: condition: service_completed_successfully`).
+- The Compose service `migrate` runs `backend migrate up` once and exits. On a first start the `backend` service starts only after it completes successfully (`depends_on: condition: service_completed_successfully`). On an update the migration runs while the previous backend is still running, and the backend is replaced after it (v7-24).
 - Migrations use the expand and contract approach: add new columns or tables first, switch the code, and remove old columns in a later release. This keeps the previous version of the API working against the new schema, so a code rollback does not break the database.
 - The v7-6 changes (`broadcast_outages`, the `missed` status, the new `play_log` columns) are added as a single expand migration. The previous code ignores the new columns and the new status values, so it still works after rollback.
 - The v7-7 changes (the rename of categories to playlists, `playlist_types`, `clock_element_playlists`, removed in v7-23) follow the same rule. The expand migration creates `playlist_types`, `playlists`, `track_playlists`, and `clock_element_playlists`, seeds the four system types, and copies the data from the old category tables (`categories`, `track_categories`, and `clock_elements.category_id`, which becomes one `clock_element_playlists` row per element). The old tables and columns are left in place and are removed by a contract migration in a later release. Until then, the previous code keeps working against the old tables.
 - The v7-8 changes (`play_rules`, `track_play_rules`, `playlist_play_rules`) use the same approach. The expand migration creates the new tables and copies each row of `daypart_rules` into a `play_rules` row (time window and weekdays) with a matching target row (a track or a playlist; the old `jingle` target is copied as a track). `daypart_rules` stays in place until a contract migration in a later release.
 - The v7-9 filler columns were added as an expand migration with nullable columns. The v7-23 migration (`docs/phase-23-plan.md` §3.1) is an exception to expand and contract: it deletes clocks, the grid, the plan, and the filler and separation tables in one step, because no release had aired (development data only).
+- **Release 1.0.0 is the baseline** (v7-24). No release below it is installed. From 1.0.0 on, a release's migrations are expand-only and safe to run while the previous release runs; the migration connection gives up on a lock after 10 seconds instead of stalling the running service. A contract migration (dropping what an older release used) comes no earlier than the release after the one that stopped using it, is reviewed, and is marked in the release notes.
+- **Downgrade guard** (v7-24, deploy plan §9.4). The table `schema_compat` holds one row, `min_app_version`: the oldest release that works with the schema. A contract migration raises it to the release that stopped using what it drops. `backend serve` refuses to start when its version is below it, and `backend migrate check` reports it. `migrate up` with an older binary does nothing (the schema is newer), so a downgrade within the guard changes only the images.
 
 **Forward-only migrations (no rollback)**
 
 - Migrations are forward-only. Each migration has only an `.up.sql` file. No `.down.sql` files are written, and no command or script runs `migrate down`.
 - Rolling back schema changes in PostgreSQL is unreliable: data may already have been transformed, objects dropped, or a migration partly applied. The project does not rely on down migrations.
-- If a migration fails, the recovery procedure is:
-  1. Restore the database from the dump made for this update, seconds before the migration ran (§9.2, step 7), using `update.bat restore`. This also clears a "dirty" migration state, so no down migration is needed.
-  2. Restore the previous code tag (`update.bat rollback`).
-  3. Fix the problem, write a new forward migration, release it, and apply it through the normal update.
-- Because the dump is taken right before `migrate`, the data lost by a restore is only what was written between the dump and the restore. The restore decision is manual.
+- A failed migration is undone automatically, and broadcasting continues on the running release; the operator makes no decision (v7-24, deploy plan §7.3 step 7):
+  - Each migration file runs in one implicit transaction (golang-migrate sends it as one simple-protocol query), so a failure, a lock timeout included, rolls back the whole file. `backend migrate up` then resets the version to the last applied migration, so the database is not left "dirty", and exits with a distinct code ("rolled back, schema unchanged at version N"). Migrations applied earlier in the same run stay; they are expand-only, so the running release works with them. The update tool aborts, keeps the running images, and tells the operator that the update was undone.
+  - A statement that cannot run in a transaction (`CREATE INDEX CONCURRENTLY`) is the only statement of a file marked non-transactional; files with explicit transaction control are rejected in the backend's CI. If such a file fails, or the outcome is unknown, the database is "dirty": the update tool restores the dump made seconds before the migration, restarts the running release, and reports the same way. The data written between the dump and the restore is lost (minutes); the play log of that window is rebuilt from the playout journal (§7.1).
+  - The developer fixes the problem in a new release with a new forward migration.
+- `update.bat restore` remains for a manual restore of a recorded dump, with a typed confirmation.
 - Destructive migrations (dropping data) are reviewed before release and are never shipped in the same release as the code that stops using the data.
 
-**The update script (`update.bat` → `update.ps1`, in `radio-atlantida-deploy`)**
+**The update script (`update.bat` → `bin/radioctl` inside WSL, in `radio-atlantida-deploy`)**
 
-Usage:
+Usage (v7-24; the details are in the deploy plan §6):
 
-- `update.bat`: update to the tag in `IMAGE_TAG` (or the latest tag from the deploy repository, if set).
-- `update.bat 1.4.3`: update to a specific tag.
-- `update.bat rollback`: return to the previous tag recorded before the last update.
-- `update.bat restore`: restore the database from the dump recorded for the last update (`pg_restore --clean`). The script asks for confirmation and shows the dump file name and its UTC time first.
+- `update.bat`: install the release named in `release.env`.
+- `update.bat <backend tag> [<frontend tag>]`: install any release from 1.0.0 on, newer or older. The frontend tag defaults to the backend tag. Both images must exist and have the same MAJOR.MINOR.
+- `update.bat rollback`: install the release that ran before the last update.
+- `update.bat restore`: restore the database from the dump recorded for the last update (`pg_restore --clean`). The script stops the backend, shows the dump file name and its UTC time, and asks for confirmation first.
+- `update.bat maintenance`: apply changes that need a restart of `liquidsoap` or `db` (a new image or a changed script), after confirmation.
+- `update.bat backup`, `update.bat restore-drill`: the daily dump and the monthly restore test (§10).
 
-Steps, in order:
+Steps of an update, in order:
 
-1. **Preflight**: check that Docker Desktop is running and that the Docker engine responds. If not, stop with a message. The script does not install or upgrade Docker Desktop, because that installer is manual. When monitoring is enabled in `.env` (§10.3), its passwords must be set; otherwise the script stops before any change and names the missing variable.
-2. **Live check**: query the API for the live status. If a broadcast is on air, the script asks for confirmation before continuing. If an outage is open (§7.1), the script stops and reports it.
-3. **Fetch the deploy repository**: `git pull` (or a zip download if Git is not installed). Show what changed.
-4. **Record the current tag** in `state.json` so rollback knows where to return.
-5. **Login to the registry** with the token from `.env` (`docker login ghcr.io`), if not already logged in.
-6. **Pull the images**: `docker compose pull`.
-7. **Backup the database (mandatory)**: `docker compose exec db pg_dump -Fc` into `backups/db-YYYY-MM-DDTHHMMSSZ.dump`. The file name uses the UTC time (§10.2). A dump is made on every update, including updates without migrations, and the script has no flag to skip it. If the dump fails, the update stops. The dump path is saved in `state.json` for this run, so a restore uses exactly this dump. The script keeps the last 14 dumps and deletes older ones.
-8. **Migrate**: `docker compose run --rm migrate`. If it fails, the script stops, does not start the new `backend`, and reports the error.
-9. **Restart services**: `docker compose up -d`. Compose recreates only containers whose image or configuration changed, so `liquidsoap` and `icecast` keep running if their images did not change. When monitoring is enabled, the monitoring services are started after that in a separate call (§10.3).
-10. **Health check**: wait for the healthchecks of `db`, `backend`, and `liquidsoap` to pass, with a timeout. Grafana is not part of this check: a failure of the monitoring services is reported as a warning and never triggers step 11, because monitoring does not affect the air.
-11. **On failure**: set `IMAGE_TAG` back to the recorded previous tag, run `docker compose up -d`, and report the error. Migrations are not rolled back, and the script never runs down migrations. Because of the expand and contract rule, the previous code still works with the new schema. If the migration itself failed, the database is restored with `update.bat restore`, using the dump recorded for this run (see "Forward-only migrations" above).
-12. **Log the run**: write the steps, the tags, and the result to `logs/update-YYYY-MM-DDTHHMMSSZ.log` (UTC).
+1. **Preflight**: the Docker Engine in the distribution responds; installing or upgrading the engine is a step of `install.bat`, not of an update. When monitoring is enabled in `.env` (§10.3), its passwords must be set.
+2. **Fetch the deploy repository**: `git pull --ff-only` inside the distribution. Show what changed.
+3. **Release check**: log in to the registry with the token from `.env`; both images of the target exist and match their digests; the backend and frontend versions are compatible, and the backend is not older than the Liquidsoap script requires. For an older target, the database's `min_app_version` must not be above it; otherwise the script refuses and offers to restore the dump taken before the update that crossed it.
+4. **Air check**: an open outage (§7.1) stops the update; live voice on air, or an unknown state, asks for confirmation; the backend must have its control link and at least two items queued in Liquidsoap; the script waits while the next hour is being pushed (`playout.prepush_minutes` before the hour).
+5. **Pull the images** and record their digests in `state.json`.
+6. **Backup the database (mandatory)**: `pg_dump -Fc` into a file named with the UTC time (§10.2). A dump is made on every update, and the script has no flag to skip it. If the dump fails, the update stops. The dump is recorded for this run in `state.json`.
+7. **Migrate** while the previous backend runs (newer targets only). If it fails, the update is undone automatically as described under "Forward-only migrations" (a rolled-back migration needs nothing more; a dirty database is restored from this run's dump), the previous release keeps broadcasting, and the operator gets a plain message to send the log to the developer.
+8. **Replace the backend** (`up -d --no-deps backend`, with a stop grace period of 30 seconds for its drain), then wait for it: ready, control link connected, items queued. Then the frontend, then Loki, Alloy, and Grafana; a monitoring failure is only a warning.
+9. **On failure** after the backend was replaced (health gate): reinstall the previous release by digest automatically and report with the same plain message. Migrations are not rolled back; the previous release works with the new schema (expand and contract).
+10. **Report pending maintenance**: a new Liquidsoap or PostgreSQL image or a changed Liquidsoap script is recorded and applied only by `update.bat maintenance`.
+11. **Log the run** to `logs/update-YYYY-MM-DDTHHMMSSZ.log` (UTC).
+
+Two backends never run side by side (no blue/green): there is one pusher to Liquidsoap, one live voice UDP port, and the playout and safety state live in the backend's memory.
 
 **Effect on air**
 
 - Restarting `backend` interrupts the WebRTC voice session and the WebSocket connection of the panel. It does not stop playout, because Liquidsoap keeps the planned queue (§12). The playout journal records what aired during the restart, and reconciliation runs afterwards (§7.1). The restart is recorded as an outage with `component = backend` if the stream is affected.
-- Restarting `liquidsoap` or `icecast` interrupts the stream. The script restarts them only when their images or configuration changed, and the live check in step 2 warns before that. Such a restart is detected as an outage, and the items planned during it are marked missed unless the journal confirms them.
+- Restarting `liquidsoap` interrupts the stream. It happens only in `update.bat maintenance`, after confirmation, in a window the manager chooses. Such a restart is detected as an outage, and the items planned during it are marked missed unless the journal confirms them. A change of the stream output settings needs no restart (§8.8).
 
 ## 10. Operational Requirements
 
-- Access control: none in the panel by design (single operator). The API and control ports must therefore be reachable only from localhost or a trusted private network. Firewall rules on the Windows host enforce this.
+- Access control: none in the panel by design (single operator). The API and control ports must therefore be reachable only from localhost or a trusted private network. In production the panel and live voice are reachable from the station machine only (v7-24, §9); access from the LAN, with HTTPS and firewall rules, is a possible later step.
 - Time synchronization via NTP on the host, because clock start times depend on it.
 - Time and timezones: all stored times are UTC; the panel displays them in the selected timezone. See §10.2.
 - Fallback content available if the engine or database is unavailable.
 - Logging: structured logs in the backend; Liquidsoap logs to a file or stdout.
 - Monitoring: an optional Grafana shows the live state of the database (§10.3) and searches the application logs and the playout journal (§10.4).
-- Backups: daily PostgreSQL dumps, a copy of the media directory kept outside the machine that runs the stack (the media directory itself is not duplicated inside Docker), and a copy of the playout journal directory with the database dumps.
+- Backups (v7-24): on the machine that runs the stack, a PostgreSQL dump before every update and a daily dump with a copy of the playout journal (a systemd timer in the distribution runs `radioctl backup`, and the newest set is also copied to a folder on the Windows drive, so a damaged or removed distribution does not take the backups with it); 14 daily and 14 update dumps are kept, and the dumps needed to undo a contract migration are kept longer (§9.2); a restore into a scratch database is tested monthly. The recovery point is 24 hours. There is no off-site copy: a loss of the machine's disk loses the database, the dumps, the journal, and the media directory together. A copy of the media directory outside the machine is the operator's responsibility.
 
 ### 10.1 Logging and diagnostics
 
 **Format and library**
 
-- Logs are written as JSON Lines: one JSON object per line. The panel and tools like `jq` can read them directly.
+- Logs are written to stdout as JSON Lines: one JSON object per line, so `jq` can read the stdout copy. The backend also pushes each entry to Loki (see Log storage below), and the panel reads them from Loki through `GET /api/logs`.
 - Library: `log/slog` from the Go standard library, with its JSON handler. It needs no extra dependency and is fast enough for this volume. `zap` or `zerolog` are alternatives if profiling shows a need.
-- Each entry contains: `time` (RFC 3339 with offset), `level`, `msg`, `component`, and error details as fields. `component` is one of `api`, `db`, `rotation`, `liquidsoap`, `icecast`, `webrtc`, `retention`, `outage`, `reconcile`, `media` (import, analysis, transcoding; v7-14). API errors also carry `request_id`.
+- Each entry contains: `time` (RFC 3339 with offset), `level`, `msg`, `component`, and error details as fields. `component` is one of `api`, `db`, `rotation`, `liquidsoap`, `icecast`, `webrtc`, `retention`, `outage`, `reconcile`, `media` (import, analysis, transcoding; v7-14). API errors also carry `request_id`. An entry without a component is labelled `component="none"` in Loki.
 - Secrets (`ICECAST_SOURCE_PASSWORD`, `LIQUIDSOAP_CONTROL_USER`, `LIQUIDSOAP_CONTROL_PASSWORD`) are never logged. A handler masks any field with a sensitive name.
 
 **What is logged**
@@ -914,19 +953,20 @@ Steps, in order:
 - An open outage is shown as a persistent banner until it closes, not as a popup that can be missed.
 - Alerts are shown with their UTC timestamp converted to the selected timezone.
 
-**Rotation**
+**Log storage**
 
-- One file per day: `app-YYYY-MM-DD.log` in a host directory set by `LOG_ROOT`. The date is the UTC date. Timestamps inside entries are UTC as well.
-- Cleanup of files older than 10 days is also computed in UTC.
-- A small daily rotator (an `io.Writer` in the backend) switches to a new file at midnight. On each rotation it deletes files older than 10 days.
-- Alternative for size limits: `gopkg.in/natefinch/lumberjack.v2`, which supports size-based rotation, maximum age, and backup count. It does not rotate by day by default, so it is a fallback if a single day's file grows too large.
-- Logging must never block playout. Entries are sent through a buffered channel. If the buffer is full, entries are dropped, the drop count is incremented, and a warning is logged once the buffer drains. A log write failure never stops the stream.
+- The backend writes no log files and does no rotation. The JSON handler writes each entry to stdout and also hands it to a Loki sink in `internal/logging`, which pushes it to Loki's push API (`POST /loki/api/v1/push`). The same code runs on the host and in a container.
+- Labels: `job="backend"`, `level`, `component` (set to `none` when an entry has none). The entry's UTC `time` is the Loki timestamp. Other fields stay in the line and are filtered in queries (§10.4).
+- The sink never blocks the logger. Entries go through a bounded buffer; when it is full, entries are dropped, and the count of dropped entries is written to stdout once a minute. When Loki does not answer, a batch is retried a few times and then dropped, with the loss counted. Lines dropped while Loki was down are not restored; they stay on stdout.
+- Logging must never block playout. A log write failure never stops the stream.
+- Retention is Loki's: 10 days (§10.4).
 
 **Access from the panel**
 
-- The Logs section in Angular has a dropdown of available files (one per day, newest first, showing date and size), loaded from `GET /api/logs/files`.
-- `GET /api/logs/files/{name}` returns entries, newest first, with optional filters `level`, `component`, `limit`, `offset`.
-- The file name must match `app-YYYY-MM-DD.log`, and the server reads only from `LOG_ROOT`. This prevents path traversal.
+- The Logs section in Angular reads `GET /api/logs`. The backend answers from Loki; the browser never talks to Loki.
+- Query parameters: `from` and `to` (required, `from` before `to`; the backend sets no limit on the window); `level` (minimum level: `DEBUG`, `INFO`, `WARN`, `ERROR`); `component` (one of the components listed above); `search` (1 to 200 characters, a case-insensitive substring of the decoded `msg` field); `request_id`; `limit` (default 100, 1 to 500); `cursor` (opaque, taken from the previous page's `next_cursor`).
+- The response (`LogEntryPage`) holds `items`, newest first, with `next_cursor` (absent on the last page) and `total` (optional: it is left out when the count does not finish in time).
+- Errors: 422 with field codes `query.<parameter>`; 422 `range_too_long` when Loki refuses the window for its own length limit; 503 `logs_unavailable` when Loki does not answer in time.
 - Timestamps are converted to the timezone selected in the panel (default `Asia/Yerevan`, see §10.2).
 - The API has no authentication (see §6), so this endpoint is subject to the same network restrictions.
 
@@ -937,7 +977,7 @@ Steps, in order:
 - Every column that holds an instant uses `timestamptz`. `timestamp without time zone` is not used.
 - The PostgreSQL session timezone is set to UTC.
 - The Go backend computes and stores all instants in UTC. Conversion happens only at the edges: parsing input and producing output.
-- Logs are UTC: timestamps inside entries and the date in file names (`app-YYYY-MM-DD.log`).
+- Logs are UTC: timestamps inside entries are UTC.
 - The playout journal uses UTC timestamps for every line.
 
 **Display**
@@ -964,10 +1004,10 @@ Steps, in order:
 **Service**
 
 - `grafana`: the official open source image, pinned to an exact tag like every infrastructure image. One named volume for Grafana's own state; it holds nothing that cannot be rebuilt from the provisioning files.
-- Published only on `127.0.0.1` (port from `.env`, default 3000), like the panel (deploy plan §8.1). The address is not configurable, so Grafana cannot be exposed to the LAN by mistake.
+- Published only on `127.0.0.1` (port from `.env`, default 3000), like the panel (deploy plan §10.1). The address is not configurable, so Grafana cannot be exposed to the LAN by mistake.
 - Monitoring is optional and enabled in `.env` (`MONITORING_ENABLED`), so it can be switched off to save memory on the production machine. In the dev stack it is the compose profile `monitoring`.
 - The machine may be offline: update checks, usage reporting, and the news feed are switched off.
-- No other service depends on `grafana`. Its failure never affects playout, the backend, or an update (§9.2, step 10).
+- No other service depends on `grafana`. Its failure never affects playout, the backend, or an update (§9.2, step 8).
 
 **Panel link**
 
@@ -998,27 +1038,27 @@ Steps, in order:
 
 - The same Grafana (§10.3) searches and filters the application logs (§10.1) and the playout journal (§7.1), and shows how many errors each component logged over time. It complements the Logs section of the panel; it does not replace it.
 - No alerts in this version. Grafana alert rules on log queries can be added later without backend changes.
-- The backend code does not change: the log format of §10.1 (JSON Lines, UTC `time`, `level`, `component`) is read as it is.
+- The backend pushes its log to Loki itself (§10.1). The log format of §10.1 (JSON Lines, UTC `time`, `level`, `component`) is used as it is.
 
 **Services**
 
-- `loki`: log storage, single process, filesystem storage in a named volume. Not published; Grafana reaches it on the internal network. No multi-tenancy (`auth_enabled: false`), since only Grafana and Alloy can reach it.
-- `alloy` (Grafana Alloy): the collector. It reads `LOG_ROOT` and `PLAYOUT_JOURNAL_ROOT` read-only and sends every new line to Loki. Its read positions live in a named volume, so a restart neither loses nor repeats lines. Not published.
-- Both are pinned images, part of the monitoring switch of §10.3 (one switch for all monitoring services), and nothing else depends on them.
+- `loki`: log storage, single process, filesystem storage in a named volume. Not published in production. In development it is bound to `127.0.0.1:3100`, so `make run` on the host can push to it. Grafana, Alloy and the backend reach it on the internal network. No multi-tenancy (`auth_enabled: false`), since only these services can reach it. Core service: it runs with `MONITORING_ENABLED=false` too, because the Logs page of the panel reads it.
+- `alloy` (Grafana Alloy): the collector for the playout journal. It reads `PLAYOUT_JOURNAL_ROOT` read-only and sends every new line to Loki. Alloy does not read the backend's log, which the backend pushes itself. Its read positions live in a named volume, so a restart neither loses nor repeats lines. Not published. Core service, outside the monitoring switch.
+- Both are pinned images. They are core services, outside the monitoring switch of §10.3: with `MONITORING_ENABLED=false` only Grafana is off.
 
 **What is collected**
 
-- Application logs: the files `app-YYYY-MM-DD.log` in `LOG_ROOT`, not the container's stdout, so each entry is collected once and survives container recreation. Labels: `job="backend"`, `level`, `component`. `request_id`, `err`, and other fields stay in the line and are filtered in queries, not as labels, so the label set stays small.
+- Application logs: pushed by the backend itself (§10.1), so no collector reads them and each entry is sent once. Labels: `job="backend"`, `level`, `component`. `request_id`, `err`, and other fields stay in the line and are filtered in queries (`| json`), not as labels, so the label set stays small.
 - Playout journal: the files `journal-YYYY-MM-DD.jsonl` in `PLAYOUT_JOURNAL_ROOT`. Labels: `job="playout-journal"`, `event` (`start`, `end`, `output`), `source`. The line time is the entry's `time` field, for both sources.
-- Both sources also carry `file`, the name of the daily file. Loki accepts a line at most about an hour older than the newest line of its stream; with one stream per file, an older file read after a newer one (a first start, a long stop of the collector) is still accepted. It has at most ten values per source.
+- The journal lines also carry `file`, the name of the daily journal file. Loki accepts a line at most about an hour older than the newest line of its stream; with one stream per file, an older file read after a newer one (a first start, a long stop of the collector) is still accepted. It has at most ten values.
 - Not collected: stdout of `liquidsoap`, `icecast`, `db`, and the other containers (Docker `json-file` logs, deploy plan D2). Collecting them needs access to the Docker socket and is a later step.
-- The files on the host stay the source of truth (§10.1, §7.1). Loki is a searchable copy.
+- The journal file on the host stays the source of truth (§7.1). Loki is the only store of the backend's log (§10.1), and a searchable copy of the journal.
 
 **Retention and files**
 
-- Loki keeps 10 days, like the log files (`retention.log_days` default) and the journal. Lines up to 10 days old are accepted, so a first start or a long stop of the collector loads the files still on disk.
-- The files are on the Windows file system through the WSL2 layer, where file change notifications are not reliable. Alloy polls the files and the folders, so new lines, the daily file switch, and the deletion of old files are seen without notifications.
-- Loki's and Alloy's volumes are not backed up: both can be rebuilt from the files on the host while they exist.
+- Loki keeps 10 days (`retention_period: 240h` in its configuration, which is deploy configuration, not an admin setting), for the backend's log and the journal. For the journal, lines up to 10 days old are accepted, so a first start or a long stop of the collector loads the files still on disk.
+- Alloy polls the journal folder (kept from the time the journal lived on the Windows file system, where file change notifications were not reliable; since v7-24 it is on the distribution's ext4 file system), so new lines, the daily journal file switch, and the deletion of old files are seen without notifications.
+- Loki's and Alloy's volumes are not backed up. The journal can be rebuilt from its files on the host while they exist. The backend's log is kept only in Loki and on stdout; it is not backed up (a decision of 2026-10-29: the log is short-lived, 10 days, and not worth a backup).
 
 **Configuration as files**
 
@@ -1032,9 +1072,9 @@ The open questions from the previous version are closed. The decisions are recor
 2. **Separation is a play rule** (v7-23). The `separation_rules` table is removed; its values became the play rule "Music rotation" (track and artist intervals) attached to the music playlists (§7.3).
 3. **Play log volume.** No partitioning. A nightly `DELETE` of aired rows older than 10 days is sufficient for the expected volume, which PostgreSQL handles easily (§4.1). Open missed items are exempt from this deletion.
 4. **Live voice latency budget.** Target of at most 1 second from microphone to air. The system runs locally on one machine with local Docker (§8.4).
-5. **Production Icecast details.** Entered in the admin panel and stored in the database, like all other output settings. Nothing is set in code or files (§8.8, §6.3).
-6. **Windows host.** Windows 10 or 11 with Docker Desktop (WSL2 backend), SSD storage. No separate performance test is required before going live (§9.1).
-7. **Host paths.** `MEDIA_ROOT`, `LOG_ROOT`, and `PLAYOUT_JOURNAL_ROOT` are set once in the Compose `.env` file and never change. They are not editable in the UI (§6.3, §3.1).
+5. **Production Icecast details.** Entered in the admin panel and stored in the database, like all other output settings. Nothing is set in code or files (§8.8, §6.3). The production server is external (no Icecast container in production), reached over TLS; its mount needs `<charset>UTF-8</charset>` for non-Latin titles (v7-24).
+6. **Windows host.** Windows 10 (19044 or later, Store WSL) or Windows 11, SSD storage, Docker Engine in a dedicated WSL2 distribution set up by `install.bat`, started at boot without a sign-in (v7-24; Docker Desktop was dropped because it runs only in a signed-in user session). No separate performance test is required before going live (§9.1).
+7. **Host paths.** `MEDIA_ROOT` and `PLAYOUT_JOURNAL_ROOT` are set once in the Compose `.env` file and never change. They are not editable in the UI (§6.3, §3.1).
 8. **Viper.** Removed. Runtime configuration lives in the admin settings, and no YAML profile is used (§3.1).
 9. **Source repositories.** Three repositories: `radio-atlantida-backend`, `radio-atlantida-frontend`, `radio-atlantida-deploy`. Their roles and release coupling are described in §1.1.
 10. **Missed items are not automatically re-aired.** A missed item is never pushed back into the plan by the system. Only the manager decides whether to reschedule or dismiss it (§7.1). Reason: an automatic repeat could place content in a wrong context, for example a news segment after its time.
@@ -1052,22 +1092,29 @@ The open questions from the previous version are closed. The decisions are recor
 22. **References to plan rows.** Missed items live in `play_log`, so `scheduled_items.reschedule_of_id` references `play_log`. `play_log.scheduled_item_id` and `resolved_item_id` are trace ids without a foreign key, because `scheduled_items` rows are deleted after they air (§4, §4.1).
 23. **History blocks deletes.** Tracks, artists, and clocks referenced by the play log or the track plan cannot be deleted (§4).
 24. **No filler** (v7-23). The fill playlists fill the hour; filler modes, pools, the save dialog, and reminders are removed. A gap no fill track can serve uses the emergency steps (§7).
-25. **Journal path is an environment variable.** `PLAYOUT_JOURNAL_ROOT` is a host path set in `.env`, like `MEDIA_ROOT` and `LOG_ROOT`. Liquidsoap writes the journal to it, and the backend reads it read-only (§3.1, §7.1, §9).
+25. **Journal path is an environment variable.** `PLAYOUT_JOURNAL_ROOT` is a host path set in `.env`, like `MEDIA_ROOT`. Liquidsoap writes the journal to it, and the backend reads it read-only (§3.1, §7.1, §9).
 
 26. **Repository layer.** All SQL lives in `internal/repository/<domain>`, one package per domain, named as the domain package. Domain code depends on interfaces it declares itself, and the repositories implement them. Reason: business rules stay free of SQL and driver errors, and a domain rename changes the domain and its repository in the same change (§5.1).
 27. **Import and transcoding.** The manager imports a folder of the media root, and its new files are registered where they lie (v7-18, decided 2026-10-16; the inbox and library folders of v7-14 are gone); there is no upload through the panel. Analysis flags problems against the broadcast standard set in the admin settings, and nothing changes audio without the manager: the panel offers "Fix loudness" and "Optimize track", and the manager chooses whether the fixed file replaces the original or is kept as an optimal copy next to it (§8.7, decided 2026-10-14).
 28. **Live voice without transcoding.** The bridge relays the browser's Opus packets to the harbor as Ogg/Opus, without decoding, using `pion/webrtc` (pure Go, no cgo). Its UDP port and public addresses are environment variables like `HTTP_ADDR`, because they belong to the compose port mapping (§8.4, decided 2026-10-14).
 29. **Database monitoring is a live view.** An optional Grafana reads PostgreSQL's statistics views directly through a read-only role, with a login, bound to localhost. No metrics history, no Prometheus, and no backend changes; a metrics history can be added later without backend changes (§10.3, decided 2026-10-15).
-30. **Log search in Grafana.** Loki stores the application logs and the playout journal, collected by Grafana Alloy from the files on the host (not from container stdout), with 10 days of retention like the files. No alerts in this version; the backend does not change (§10.4, decided 2026-10-15).
+30. **Log search in Grafana.** Loki stores the playout journal, collected by Grafana Alloy from its file on the host, and the backend's application log, which the backend pushes to Loki (changed on 2026-10-29 from collection of the daily files by Alloy; see `docs/logs-loki-plan.md`). Loki keeps 10 days. No alerts in this version (§10.4, decided 2026-10-15).
 31. **Cue points, never trimming.** The manager cuts the edges of a track (applause, talk, noise) by a cue in and cue out point with fades, edited on a waveform in the panel; the file is not changed, Liquidsoap plays only that part, and the planner fits the track by its length on air. Plan items keep the cut they were planned with; a changed cut rebuilds the future hours that hold the track (§4, §6.4, §7, §8.1, §8.5, decided 2026-10-16).
+32. **Stream output applied at runtime** (v7-24). A stream setting change replaces Liquidsoap's Icecast output over the control link; the container is not restarted, and only the connection to the server is renewed (§6.3, §8.8).
+33. **Separate release tags and any-release install** (v7-24). Backend and frontend have their own tags, compatible within one MAJOR.MINOR. The deploy repository names a release in `release.env` with digests, and `update.bat <tag>` installs any release from 1.0.0 on; a downgrade is refused when the schema's `min_app_version` is above the target (§1.1, §9.2).
+34. **Liquidsoap restarts only in maintenance** (v7-24). A normal update replaces the backend and the frontend one by one and never restarts `liquidsoap` or `db`; those changes wait for `update.bat maintenance` (§9.2).
+35. **Backups stay on the machine** (v7-24). Daily and pre-update dumps with the journal, 24-hour recovery point, monthly restore test, no off-site copy; the risk of a disk loss is accepted (§10).
+36. **Automated host install** (v7-24). `install.bat` makes a Windows 10 or 11 machine ready: WSL2, a pinned Ubuntu LTS distribution, Docker Engine with pinned versions, a dedicated local account whose scheduled task keeps the distribution running from boot, host power and update settings, and the first configuration of the stack. It chooses NAT or mirrored networking from the Windows build, is idempotent, and resumes after the reboot it needs (§9.1, §9.2).
+37. **Multi-arch images** (v7-24). Backend and frontend tags are manifest lists for amd64 and arm64; production runs amd64, the developer's Mac runs the same release natively on arm64 (§1.1, §9.2).
+38. **Media stays in the Windows folder** (v7-24). The existing Windows folder of tracks is the media root, through WSL's drive mount; copying it into the distribution is the fallback (§9.1).
 
 ## 12. Non-functional Requirements
 
-- The clock grid covers up to 30 days ahead. The track plan is generated automatically and covers a rolling window of 24 to 48 hours.
+- The clock grid covers up to 183 days (about six months) ahead. The track plan is generated automatically and covers a rolling window of 24 to 48 hours.
 - A failure in the management panel or API must not stop the air. Playout continues from the planned queue.
 - Rotation generation for one hour completes within a few seconds for a library of tens of thousands of tracks.
 - The play log holds at most 10 days of aired history. Open missed items are kept until resolved.
-- Application logs are JSON, one file per day, and are kept for 10 days (see §10.1). Logging never blocks playout.
+- Application logs are JSON lines, written to stdout and pushed to Loki, and are kept there for 10 days (see §10.1, §10.4). Logging never blocks playout.
 - All changes that affect air are recorded with a UTC timestamp, including outages and missed-item decisions.
 - All stored times are UTC; the panel displays them in the selected timezone (default `Asia/Yerevan`, UTC+04:00).
 - Clock boundaries are exact: a clock starts within one second of its scheduled time (§8.10).
