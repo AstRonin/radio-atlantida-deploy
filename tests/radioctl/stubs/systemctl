@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Stub of systemctl for the bats tests (calls in $STUB_DIR/calls.log).
+#   systemctl_enabled.rc   exit code of `is-enabled` (default 0: enabled)
+set -uo pipefail
+S=${STUB_DIR:?}
+printf 'systemctl %s\n' "$*" >>"$S/calls.log"
+case ${1:-} in
+  is-enabled) exit "$(cat "$S/systemctl_enabled.rc" 2>/dev/null || echo 0)" ;;
+  *) exit 0 ;;
+esac

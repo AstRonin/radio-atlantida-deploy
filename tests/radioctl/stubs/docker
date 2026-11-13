@@ -11,6 +11,8 @@
 #   running_backend            the backend tag that runs ("stopped" if none)
 #   health_<service>           container health (default healthy)
 #   db_min_app_after.out       min_app_version once `migrate up` ran
+#   db_drill_counts.out        "table|rows" lines of the restore drill
+#   drill_create.rc, drill_drop.rc   CREATE / DROP DATABASE of the drill
 set -uo pipefail
 S=${STUB_DIR:?}
 printf '%s\n' "$*" >>"$S/calls.log"
@@ -134,10 +136,25 @@ db_exec() {
       echo "PGDMP fake dump"
       ;;
     *pg_restore*)
+      # RESTORE <database>: the drill restores into its scratch database.
+      local db='?' prev=
+      for a in "$@"; do
+        [[ $prev == -d ]] && db=$a
+        prev=$a
+      done
       cat >"$S/restored_from"
-      printf 'RESTORE\n' >>"$S/events.log"
+      printf 'RESTORE %s\n' "$db" >>"$S/events.log"
       answer pg_restore
       ;;
+    *"DROP DATABASE"*)
+      printf 'DROPDB\n' >>"$S/events.log"
+      answer drill_drop
+      ;;
+    *"CREATE DATABASE"*)
+      printf 'CREATEDB\n' >>"$S/events.log"
+      answer drill_create
+      ;;
+    *query_to_xml*) answer db_drill_counts "$(printf '%s\n' settings\|40 tracks\|812 artists\|300 playlists\|12 clocks\|8 grid_slots\|168 scheduled_items\|2000 play_log\|5000)" ;;
     *"schema_migrations') IS NOT NULL"*) answer db_has_migrations t ;;
     *"FROM schema_migrations LIMIT 1"*) answer db_version "22 f" ;;
     *"schema_compat') IS NOT NULL"*) answer db_has_compat t ;;

@@ -136,7 +136,7 @@ first_run_setup() {
   # The stub starts the backend on "up"; the first run then reads /readyz.
 }
 
-@test "first run: .env written, stack started without liquidsoap, no air check, no dump" {
+@test "first run: .env written, stack started without liquidsoap, no air check, no pre-update dump" {
   first_run_setup
   run radioctl --yes first-run --media-root "$ROOT/media" <<<$'ghuser\nghtoken\nicepass'
   [ "$status" -eq 0 ]
@@ -145,9 +145,11 @@ first_run_setup() {
   refute_contains "$output" "ghtoken"
   refute_contains "$output" "icepass"
   run events
-  [[ $output == *"UP db"*"MIGRATE 1.0.1"*"UP backend 1.0.1"*"UP frontend 1.0.1"* ]]
+  # The only dump is the first daily backup, after the stack is up (6.8 step 7).
+  [[ $output == *"UP db"*"MIGRATE 1.0.1"*"UP backend 1.0.1"*"UP frontend 1.0.1"*"DUMP" ]]
   refute_contains "$output" "liquidsoap"
-  refute_contains "$output" "DUMP"
+  [ "$(grep -c DUMP <<<"$output")" -eq 1 ]
+  [ ! -e "$ROOT/backups/update" ]
   [ "$(stat -c %a "$ROOT/.env")" = 600 ]
   grep -q '^GHCR_READ_TOKEN=ghtoken$' "$ROOT/.env"
   grep -q "^MEDIA_ROOT=$ROOT/media$" "$ROOT/.env"
@@ -291,12 +293,6 @@ first_run_setup() {
   [ "$status" -eq 0 ]
   assert_contains "$output" "logs/update-"
   assert_contains "$output" "Installed 1.0.1"
-}
-
-@test "backup and restore-drill are D6" {
-  run radioctl backup
-  [ "$status" -eq 1 ]
-  assert_contains "$output" "Phase D6"
 }
 
 @test "an unknown command prints the usage" {
