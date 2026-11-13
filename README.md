@@ -6,8 +6,8 @@ backend and frontend run as prebuilt images from GitHub Container Registry.
 
 The runbook (install, update, rollback, restore, maintenance, backups) is
 written in Phase D7 of `docs/deploy-init-plan.md`. Until then, see that plan
-and `docs/tech-design.md` §9. The sections below (Phases D3 and D5) become
-part of it.
+and `docs/tech-design.md` §9. The sections below (Phases D3, D5, and D6)
+become part of it.
 
 ## Production playout script
 
@@ -98,7 +98,9 @@ logged.
 | `update.bat maintenance` | apply pending `liquidsoap`/`db` changes; typed `MAINTENANCE` |
 | `update.bat cutover [--undo]` | start (or stop) `liquidsoap` on the external mount; typed `CUTOVER` |
 | `update.bat first-run` | first configuration of a new machine (called by `install.bat`) |
-| `update.bat status` | release, containers, air, pending maintenance, backups, disk, media |
+| `update.bat backup` | the daily backup now (the timer runs it at 04:30) |
+| `update.bat restore-drill [<dump>]` | restore the newest daily dump into a scratch database, check it, drop it |
+| `update.bat status` | release, containers, air, pending maintenance, backups and drill, disk, media |
 | `update.bat logs [<service>]` | the last run log, or a service's container log |
 | `update.bat compose <args>` | `docker compose` with the production files, for diagnostics |
 
@@ -118,9 +120,76 @@ undone. Broadcasting continues on Y. Send the log ... to the developer." A
 migration exit 5 (dirty) restores the pre-update dump automatically; a
 failed health gate reinstalls the previous release by digest.
 
-Not in this version: `backup`, `restore-drill`, the daily timer, the journal
-and Windows copies of a dump (Phase D6); `install.ps1`, `setup-distro.sh`,
-and `radio-network.service`, which writes `runtime/network.env` (Phase D4).
+Not in this version: `install.ps1`, `setup-distro.sh`, and
+`radio-network.service`, which writes `runtime/network.env` (Phase D4).
+
+## Backups (`update.bat backup`, `update.bat restore-drill`)
+
+Backups stay on the machine; the recovery point is 24 hours between updates
+and seconds before an update. **There is no off-site copy**: a loss of the
+machine's disk loses the database, both copies of the dumps, the journal,
+and the media folder together. **Never run `wsl --unregister
+radio-atlantida`**: it deletes the virtual disk with the database, the
+journal, and `BACKUP_ROOT`; only the Windows copy survives it.
+
+Layout, the same under `BACKUP_ROOT` (`/srv/radio/backups`, ext4) and its
+Windows copy `BACKUP_WINDOWS_COPY` (`/mnt/c/RadioAtlantida/backups`, that is
+`C:\RadioAtlantida\backups`):
+
+| Path | What |
+|------|------|
+| `daily/db-<UTC>.dump` | the daily `pg_dump -Fc` |
+| `update/db-<UTC>.dump` | the dump before every update, `db` maintenance, and restore |
+| `<daily or update>/journal-<UTC date>/` | the playout journal files (`journal-*.jsonl`), copied with every dump of that day |
+
+- **Daily backup.** `radio-backup.timer` runs `radioctl backup` as `radio`
+  every day at 04:30 station time (`Asia/Yerevan`, after the plan's nightly
+  pass at 03:00), with `Persistent=true`, so a backup missed while the
+  machine was off runs after the next boot. It dumps the database online
+  (the air is not affected), copies the journal beside the dump, copies both
+  to the Windows folder, and applies retention. It takes `state.lock`: it
+  never runs during an update and waits for one up to an hour.
+- **Windows copy.** The folder must exist (`install.bat` creates it); it is
+  never created by `radioctl`, because a missing `C:` mount would make it a
+  folder inside the virtual disk. A missing or unwritable folder is a
+  warning: the backup itself succeeded. An empty `BACKUP_WINDOWS_COPY`
+  turns the copy off.
+- **Retention**, in both locations: the newest `BACKUP_DAILY_KEEP` (14)
+  daily dumps and the newest `BACKUP_UPDATE_KEEP` (14) update dumps. Never
+  removed by retention: the dump recorded as `last_dump`, and the pre-update
+  dumps of the last `BACKUP_BOUNDARY_KEEP` (3) installs that raised
+  `min_app_version` (the restore points of a downgrade across a contract
+  migration). A journal folder goes with the last dump of its day. To free
+  space, an older boundary dump can be deleted by hand from `update/` in
+  both locations (`update.bat status` shows the disk space); never the one in
+  `state.json` `last_dump`.
+- **Restore.** `update.bat restore <dump>` takes a path, `daily/<name>` or
+  `update/<name>`, or the bare file name; it looks in `BACKUP_ROOT` first,
+  then in the Windows copy. Without a name it restores `last_dump`.
+- **Restore drill.** `radio-restore-drill.timer` runs `radioctl
+  restore-drill` on the 1st of every month at 05:30 station time
+  (`Persistent=true`); `update.bat restore-drill` runs it by hand. It
+  restores the newest daily dump into the scratch database
+  `radio_restore_drill` of the same `db` container, checks the schema
+  version (present, not dirty) and the row counts of the main tables, and
+  drops the scratch database again. It never names the production database.
+- **Results.** Every run writes `logs/backup-*.log` or
+  `logs/restore-drill-*.log` and records `last_backup`, `last_backup_utc`
+  (last success), or `last_drill` in `state.json`. `update.bat status` shows
+  the last backup with its journal and Windows copy results and warnings, the
+  last drill, `OVERDUE` when no backup succeeded for 26 hours, and `DUE`
+  when the last good drill is older than 35 days. A failed daily backup is
+  also shown by the next `update.bat`.
+- **Production data to development**: copy a dump from
+  `C:\RadioAtlantida\backups` to the Mac by hand and restore it into the dev
+  stack with `pg_restore --clean --if-exists`. Never the other way.
+
+The units are in `install/systemd/`. `setup-distro.sh` (D4) installs them as
+root with `install/systemd/install-units.sh` (copies them to
+`/etc/systemd/system`, reloads systemd, enables and starts both timers;
+idempotent). The services do nothing until `radioctl first-run` has written
+`runtime/applied.env`; the first run checks that the timers are enabled and
+runs the first backup.
 
 Tests (bats-core 1.11.1 in Docker; `docker`, `git`, and the clock are
 stubs, so no stack is needed):
