@@ -1287,14 +1287,16 @@ release_check() {
   ver_lt "$T_BTAG" "$min_backend" &&
     refuse "Refused: backend $T_BTAG is below $min_backend, the min-backend of config/liquidsoap/radio.liq."
   registry_login
-  d=$(resolve_digest "$BACKEND_IMAGE" "$T_BTAG") && [[ -n $d ]] ||
+  d=$(resolve_digest "$BACKEND_IMAGE" "$T_BTAG") || d=
+  [[ -n $d ]] ||
     refuse "Refused: the image $BACKEND_IMAGE:$T_BTAG was not found in the registry."
   if [[ -z $T_BDIG ]]; then
     T_BDIG=$d
   elif [[ $d != "$T_BDIG" ]]; then
     refuse "Refused: $BACKEND_IMAGE:$T_BTAG is $d in the registry, not $T_BDIG."
   fi
-  d=$(resolve_digest "$FRONTEND_IMAGE" "$T_FTAG") && [[ -n $d ]] ||
+  d=$(resolve_digest "$FRONTEND_IMAGE" "$T_FTAG") || d=
+  [[ -n $d ]] ||
     refuse "Refused: the image $FRONTEND_IMAGE:$T_FTAG was not found in the registry."
   if [[ -z $T_FDIG ]]; then
     T_FDIG=$d
@@ -1947,8 +1949,10 @@ cmd_first_run() {
   min_backend=$(script_min_backend "$SCRIPT_FILE") || die "config/liquidsoap/radio.liq has no min-backend header"
   ver_lt "$T_BTAG" "$min_backend" && die "backend $T_BTAG is below the script's min-backend $min_backend"
   registry_login
-  d=$(resolve_digest "$BACKEND_IMAGE" "$T_BTAG") && [[ $d == "$T_BDIG" ]] || die "$BACKEND_IMAGE:$T_BTAG is not $T_BDIG in the registry"
-  d=$(resolve_digest "$FRONTEND_IMAGE" "$T_FTAG") && [[ $d == "$T_FDIG" ]] || die "$FRONTEND_IMAGE:$T_FTAG is not $T_FDIG in the registry"
+  d=$(resolve_digest "$BACKEND_IMAGE" "$T_BTAG") || d=
+  [[ $d == "$T_BDIG" ]] || die "$BACKEND_IMAGE:$T_BTAG is not $T_BDIG in the registry"
+  d=$(resolve_digest "$FRONTEND_IMAGE" "$T_FTAG") || d=
+  [[ $d == "$T_FDIG" ]] || die "$FRONTEND_IMAGE:$T_FTAG is not $T_FDIG in the registry"
 
   write_app_env "$APPLIED_ENV" "$T_BTAG" "$T_BDIG" "$T_FTAG" "$T_FDIG"
   record_target
