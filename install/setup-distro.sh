@@ -466,7 +466,7 @@ install_units() {
   local out line sc=systemctl booted=no
   $SKIP_SYSTEMD && sc=true
   systemd_running && booted=yes
-  out=$(SYSTEMCTL=$sc SYSTEMD_BOOTED=$booted "$SRC/systemd/install-units.sh") || die "install-units.sh failed: $out"
+  out=$(SYSTEMCTL=$sc SYSTEMD_BOOTED=$booted bash "$SRC/systemd/install-units.sh") || die "install-units.sh failed: $out"
   if [[ -n $out ]]; then
     while IFS= read -r line; do
       if [[ $line == installed* ]]; then
