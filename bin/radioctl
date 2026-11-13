@@ -15,7 +15,8 @@
 #   radioctl status
 #   radioctl logs [<service>...]
 #   radioctl compose <args>
-#   radioctl backup | restore-drill        (Phase D6, not implemented yet)
+#   radioctl [options] backup              (daily, radio-backup.timer)
+#   radioctl [options] restore-drill [<dump>]  (monthly, radio-restore-drill.timer)
 #
 # Options: --dry-run, --yes, --no-wait, --no-fetch, -h/--help (see usage).
 #
@@ -600,17 +601,27 @@ read_min_app() {
 }
 
 # ---------------------------------------------------------------------------
-# Dumps (the mandatory pre-update dump and the restore; D6 adds the daily
-# backup, the journal copy, the Windows copy, and their retention)
+# Dumps and backups (plan 7.3 step 6, D6). BACKUP_ROOT and its Windows copy
+# BACKUP_WINDOWS_COPY have the same layout:
+#
+#   update/db-<UTC>.dump           pre-update, maintenance, and safety dumps
+#   daily/db-<UTC>.dump            the daily backup (radio-backup.timer)
+#   <category>/journal-<UTC date>/ the playout journal files, copied with
+#                                  each dump of that UTC day (refreshed by a
+#                                  second dump on the same day)
 
-# take_dump: pg_dump -Fc into BACKUP_ROOT/update/db-<UTC>.dump; sets DUMP.
 DUMP=
-take_dump() {
-  local dir name
-  dir=$(envv BACKUP_ROOT)/update
+BACKUP_WARNINGS=()
+JOURNAL_RESULT=none
+WINDOWS_RESULT=disabled
+
+# dump_db <category>: pg_dump -Fc into BACKUP_ROOT/<category>/db-<UTC>.dump;
+# sets DUMP.
+dump_db() {
+  local dir name i=1
+  dir=$(envv BACKUP_ROOT)/$1
   name=db-$(utc_stamp)
   DUMP=$dir/$name.dump
-  local i=1
   while [[ -e $DUMP ]]; do
     DUMP=$dir/$name-$i.dump
     i=$((i + 1))
@@ -627,14 +638,223 @@ take_dump() {
     return 1
   fi
   mv "$DUMP.part" "$DUMP"
+}
+
+# take_dump: the dump before an update, a db maintenance, or a restore, with
+# its journal and Windows copies; recorded as last_dump.
+take_dump() {
+  dump_db update || return 1
   backup_extras "$DUMP"
   state_set '.last_dump = $d' --arg d "$DUMP"
 }
 
-# backup_extras <dump>: D6 boundary. The journal copy and the copy to
-# BACKUP_WINDOWS_COPY belong to `radioctl backup` (D6 tasks 1 and 3).
+# dump_date <dump>: the UTC date in its name.
+dump_date() {
+  local b
+  b=$(basename "$1")
+  if [[ $b =~ ([0-9]{4}-[0-9]{2}-[0-9]{2})T ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+  else
+    printf 'unknown'
+  fi
+}
+
+# win_path </mnt/c/...>: the Windows spelling (C:\...), for messages.
+win_path() {
+  if [[ $1 =~ ^/mnt/([a-z])(/.*)?$ ]]; then
+    local d=${BASH_REMATCH[1]} rest=${BASH_REMATCH[2]:-}
+    printf '%s:%s' "${d^^}" "${rest//\//\\}"
+  else
+    printf '%s' "$1"
+  fi
+}
+
+backup_warn() {
+  BACKUP_WARNINGS+=("$1")
+  warn "$1"
+}
+
+# backup_extras <dump>: the journal copy next to the dump and the Windows
+# copy of both (D6 task 1). Their problems are warnings: the dump is the
+# backup, and it exists already.
 backup_extras() {
-  log "journal copy and Windows copy of $1: Phase D6, not done by this version"
+  local jdir
+  jdir=$(dirname "$1")/journal-$(dump_date "$1")
+  copy_journal "$jdir"
+  windows_copy "$1" "$jdir"
+}
+
+# copy_file <src> <dest>, copy_dir <src> <dest>: through <dest>.part, so a
+# half-written copy never has the final name. Timestamps only: the Windows
+# drive keeps no Linux owner or mode.
+copy_file() {
+  if cp --preserve=timestamps -- "$1" "$2.part" 2>&5 && mv -f -- "$2.part" "$2"; then
+    return 0
+  fi
+  rm -f -- "$2.part"
+  return 1
+}
+
+copy_dir() {
+  rm -rf -- "$2.part"
+  if cp -R --preserve=timestamps -- "$1" "$2.part" 2>&5 && rm -rf -- "$2" && mv -- "$2.part" "$2"; then
+    return 0
+  fi
+  rm -rf -- "$2.part"
+  return 1
+}
+
+# copy_journal <dest dir>: the journal-*.jsonl files of PLAYOUT_JOURNAL_ROOT
+# (the journal decides what aired, design §7.1).
+copy_journal() {
+  local dest=$1 src
+  local -a files=()
+  src=$(envv PLAYOUT_JOURNAL_ROOT)
+  JOURNAL_RESULT=none
+  if [[ ! -d $src ]]; then
+    JOURNAL_RESULT=failed
+    backup_warn "journal copy skipped: $src does not exist"
+    return 0
+  fi
+  mapfile -t files < <(find "$src" -maxdepth 1 -type f -name 'journal-*.jsonl' | LC_ALL=C sort)
+  if ((${#files[@]} == 0)); then
+    say "    journal: no journal files yet"
+    return 0
+  fi
+  if $DRY_RUN; then
+    say "    [dry-run] copy ${#files[@]} journal file(s) to $dest"
+    return 0
+  fi
+  local tmp=$dest.part
+  rm -rf -- "$tmp"
+  if mkdir -p "$tmp" && cp --preserve=timestamps -- "${files[@]}" "$tmp/" 2>&5 &&
+    rm -rf -- "$dest" && mv -- "$tmp" "$dest"; then
+    JOURNAL_RESULT=ok
+    say "    journal: ${#files[@]} file(s) -> $dest"
+    return 0
+  fi
+  rm -rf -- "$tmp"
+  JOURNAL_RESULT=failed
+  backup_warn "journal copy to $dest failed; see $LOG_REL"
+}
+
+# windows_copy <dump> <journal dir>: the same set under
+# BACKUP_WINDOWS_COPY/<category>/, so a damaged virtual disk or an
+# unregistered distribution does not take the backups with it. The folder
+# must exist (install.bat creates it): it is never created here, because a
+# missing /mnt/c would make it a folder inside the virtual disk.
+windows_copy() {
+  local win dest
+  win=$(envv BACKUP_WINDOWS_COPY)
+  WINDOWS_RESULT=disabled
+  if [[ -z $win ]]; then
+    log "BACKUP_WINDOWS_COPY is empty: no Windows copy"
+    return 0
+  fi
+  if [[ ! -d $win ]]; then
+    WINDOWS_RESULT=missing
+    backup_warn "Windows copy skipped: $win ($(win_path "$win")) does not exist; is the drive mounted? install.bat creates it"
+    return 0
+  fi
+  dest=$win/$(basename "$(dirname "$1")")
+  if $DRY_RUN; then
+    say "    [dry-run] copy $(basename "$1") and its journal folder to $dest"
+    return 0
+  fi
+  if mkdir -p "$dest" 2>&5 && copy_file "$1" "$dest/$(basename "$1")" &&
+    { [[ ! -d $2 ]] || copy_dir "$2" "$dest/$(basename "$2")"; }; then
+    WINDOWS_RESULT=ok
+    if [[ $(win_path "$dest") == "$dest" ]]; then
+      say "    Windows copy: $dest"
+    else
+      say "    Windows copy: $dest ($(win_path "$dest"))"
+    fi
+    return 0
+  fi
+  WINDOWS_RESULT=failed
+  backup_warn "Windows copy to $dest failed; see $LOG_REL"
+}
+
+# retain_dumps <category>: plan D6 task 3, in BACKUP_ROOT and in the Windows
+# copy. daily: the newest BACKUP_DAILY_KEEP dumps. update: the newest
+# BACKUP_UPDATE_KEEP, and never the recorded last_dump nor the dumps of the
+# last BACKUP_BOUNDARY_KEEP history entries with boundary: true (§10.4).
+# A journal-<date> folder goes when no kept dump of that date is beside it.
+retain_dumps() {
+  local cat=$1 keep bkeep f base
+  declare -A protected=()
+  # shellcheck disable=SC2034 # protected is passed by name to retain_dir
+  if [[ $cat == daily ]]; then
+    keep=$(envv BACKUP_DAILY_KEEP 14)
+  else
+    keep=$(envv BACKUP_UPDATE_KEEP 14)
+    bkeep=$(envv BACKUP_BOUNDARY_KEEP 3)
+    f=$(state_get '.last_dump // ""')
+    [[ -n $f ]] && protected[$(basename "$f")]=1
+    while IFS= read -r f; do
+      [[ -n $f ]] && protected[$(basename "$f")]=1
+    done < <(state_get --argjson k "$bkeep" '[.history[] | select(.boundary == true and .dump != null)] | .[-$k:] | .[].dump' 2>/dev/null || true)
+  fi
+  for base in "$(envv BACKUP_ROOT)" "$(envv BACKUP_WINDOWS_COPY)"; do
+    [[ -n $base && -d $base/$cat ]] || continue
+    retain_dir "$base/$cat" "$keep" protected "$([[ $base == "$(envv BACKUP_ROOT)" ]] || echo ' (Windows copy)')"
+  done
+}
+
+# retain_dir <dir> <keep> <protected basenames (assoc name)> <label>
+retain_dir() {
+  local dir=$1 keep=$2 label=$4 n=0 f d
+  local -n _keep_names=$3
+  declare -A kept_dates=()
+  while IFS= read -r f; do
+    n=$((n + 1))
+    if ((n <= keep)) || [[ -n ${_keep_names[$(basename "$f")]:-} ]]; then
+      kept_dates[$(dump_date "$f")]=1
+      continue
+    fi
+    say "    retention: removing $(basename "$(dirname "$f")")/$(basename "$f")$label"
+    mut rm -f -- "$f"
+  done < <(find "$dir" -maxdepth 1 -type f -name 'db-*.dump' | LC_ALL=C sort -r)
+  while IFS= read -r d; do
+    [[ -n ${kept_dates[${d##*/journal-}]:-} ]] && continue
+    say "    retention: removing $(basename "$dir")/$(basename "$d")$label"
+    mut rm -rf -- "$d"
+  done < <(find "$dir" -mindepth 1 -maxdepth 1 -type d -name 'journal-[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' | LC_ALL=C sort)
+}
+
+# find_dump <name>: an existing path; or a name relative to BACKUP_ROOT or
+# the Windows copy (update/db-....dump); or a bare file name found in their
+# update/ or daily/ folder.
+find_dump() {
+  local base sub
+  if [[ -f $1 ]]; then
+    printf '%s' "$1"
+    return 0
+  fi
+  for base in "$(envv BACKUP_ROOT)" "$(envv BACKUP_WINDOWS_COPY)"; do
+    [[ -n $base ]] || continue
+    for sub in "" update/ daily/; do
+      if [[ -f $base/$sub$1 ]]; then
+        printf '%s' "$base/$sub$1"
+        return 0
+      fi
+    done
+  done
+  return 1
+}
+
+# newest_daily_dump: in BACKUP_ROOT/daily, else in the Windows copy.
+newest_daily_dump() {
+  local base f
+  for base in "$(envv BACKUP_ROOT)" "$(envv BACKUP_WINDOWS_COPY)"; do
+    [[ -n $base && -d $base/daily ]] || continue
+    f=$(find "$base/daily" -maxdepth 1 -type f -name 'db-*.dump' | LC_ALL=C sort | tail -n 1)
+    if [[ -n $f ]]; then
+      printf '%s' "$f"
+      return 0
+    fi
+  done
+  return 1
 }
 
 # pg_restore_dump <dump>: replaces the database with the dump, in one
@@ -659,27 +879,122 @@ dump_time() {
   fi
 }
 
-# retain_update_dumps: keeps the newest BACKUP_UPDATE_KEEP update dumps,
-# the recorded last_dump, and the dumps of the last BACKUP_BOUNDARY_KEEP
-# history entries with boundary: true (plan D6 task 3, §10.4).
-retain_update_dumps() {
-  local dir keep bkeep f n=0
-  dir=$(envv BACKUP_ROOT)/update
-  [[ -d $dir ]] || return 0
-  keep=$(envv BACKUP_UPDATE_KEEP 14)
-  bkeep=$(envv BACKUP_BOUNDARY_KEEP 3)
-  declare -A protected=()
-  protected[$(state_get '.last_dump // ""')]=1
-  while IFS= read -r f; do
-    [[ -n $f ]] && protected[$f]=1
-  done < <(state_get --argjson k "$bkeep" '[.history[] | select(.boundary == true and .dump != null)] | .[-$k:] | .[].dump' 2>/dev/null || true)
-  while IFS= read -r f; do
-    n=$((n + 1))
-    ((n <= keep)) && continue
-    [[ -n ${protected[$f]:-} ]] && continue
-    say "    retention: removing $(basename "$f")"
-    mut rm -f -- "$f"
-  done < <(find "$dir" -maxdepth 1 -type f -name 'db-*.dump' | LC_ALL=C sort -r)
+# ---------------------------------------------------------------------------
+# Daily backup (D6 tasks 1 to 3)
+
+# run_backup: the daily dump, its journal and Windows copies, retention;
+# records last_backup (and last_backup_utc on success). Returns 1 on a
+# failed dump. DUMP stays the caller's (a first run records no dump).
+run_backup() {
+  local DUMP=
+  BACKUP_WARNINGS=()
+  JOURNAL_RESULT=none
+  WINDOWS_RESULT=disabled
+  step "Daily backup"
+  if ! wait_healthy db 120; then
+    backup_failed "the database container (db) is not healthy"
+    return 1
+  fi
+  if ! dump_db daily; then
+    backup_failed "pg_dump failed"
+    return 1
+  fi
+  say "    $DUMP"
+  backup_extras "$DUMP"
+  step "Retention"
+  retain_dumps daily
+  if $DRY_RUN; then
+    say "Dry run of the backup done; nothing was changed."
+    return 0
+  fi
+  state_set '.last_backup_utc = $u
+    | .last_backup = {utc: $u, result: "ok", dump: $d, journal: $j, windows_copy: $w, warnings: $warn, log: $log}' \
+    --arg u "$(utc_now)" --arg d "$DUMP" --arg j "$JOURNAL_RESULT" --arg w "$WINDOWS_RESULT" \
+    --arg log "$LOG_REL" --argjson warn "$(jq -cn '$ARGS.positional' --args "${BACKUP_WARNINGS[@]}")"
+  if ((${#BACKUP_WARNINGS[@]})); then
+    say "Backup done with ${#BACKUP_WARNINGS[@]} warning(s): $(basename "$DUMP"). Log: $LOG_REL"
+  else
+    say "Backup done: $(basename "$DUMP"). Log: $LOG_REL"
+  fi
+}
+
+# backup_failed <reason>: last_backup_utc keeps the last success.
+backup_failed() {
+  printf 'ERROR: the backup failed: %s. Send the log %s to the developer.\n' "$1" "$LOG_REL" >&4
+  log "ERROR: the backup failed: $1"
+  state_set '.last_backup = {utc: $u, result: "failed", error: $e, log: $log}' \
+    --arg u "$(utc_now)" --arg e "$1" --arg log "$LOG_REL"
+}
+
+# ---------------------------------------------------------------------------
+# Restore drill (D6 task 5): the newest daily dump into a scratch database
+# of the same db container. The production database is never named.
+
+DRILL_DB=radio_restore_drill
+# The main tables whose row counts the drill reports; a missing one fails it.
+DRILL_TABLES=(settings tracks artists playlists clocks grid_slots scheduled_items play_log)
+DRILL_ERROR='' DRILL_VERSION='' DRILL_COUNTS='{}'
+
+drill_sql() {
+  dc exec -T db psql -U "$(envv POSTGRES_USER)" -d "$1" -v ON_ERROR_STOP=1 -tAc "$2" 2>&5
+}
+
+# drill_count_sql: one "table|rows" line per DRILL_TABLES entry; -1 when the
+# table does not exist.
+drill_count_sql() {
+  local t list=
+  for t in "${DRILL_TABLES[@]}"; do list+="${list:+,}'$t'"; done
+  printf '%s' "SELECT t || '|' || CASE WHEN to_regclass('public.' || t) IS NULL THEN '-1' ELSE (xpath('/row/c/text()', query_to_xml(format('SELECT count(*) AS c FROM public.%I', t), false, true, '')))[1]::text END FROM unnest(ARRAY[$list]) AS t"
+}
+
+# drill_run <dump>: create, restore, check. Sets DRILL_ERROR on failure.
+drill_run() {
+  local out dirty line t c
+  local -a missing=()
+  DRILL_ERROR=''
+  log "+ DROP DATABASE IF EXISTS $DRILL_DB; CREATE DATABASE $DRILL_DB"
+  if ! drill_sql postgres "DROP DATABASE IF EXISTS $DRILL_DB WITH (FORCE)" >&5 ||
+    ! drill_sql postgres "CREATE DATABASE $DRILL_DB" >&5; then
+    DRILL_ERROR="the scratch database $DRILL_DB could not be created"
+    return 1
+  fi
+  say "    restoring into $DRILL_DB"
+  log "+ pg_restore -d $DRILL_DB --single-transaction --no-owner --no-privileges < $1"
+  if ! dc exec -T db pg_restore -U "$(envv POSTGRES_USER)" -d "$DRILL_DB" \
+    --single-transaction --no-owner --no-privileges <"$1" >&5 2>&5; then
+    DRILL_ERROR="pg_restore into $DRILL_DB failed"
+    return 1
+  fi
+  if ! out=$(drill_sql "$DRILL_DB" "$SCHEMA_VERSION_SQL") || [[ -z $out ]]; then
+    DRILL_ERROR="the restored database has no schema version (schema_migrations)"
+    return 1
+  fi
+  DRILL_VERSION=${out%% *}
+  dirty=${out##* }
+  if [[ $dirty != f ]]; then
+    DRILL_ERROR="the restored schema (version $DRILL_VERSION) is dirty"
+    return 1
+  fi
+  say "    schema version $DRILL_VERSION, not dirty"
+  if ! out=$(drill_sql "$DRILL_DB" "$(drill_count_sql)"); then
+    DRILL_ERROR="the row counts could not be read"
+    return 1
+  fi
+  DRILL_COUNTS='{}'
+  while IFS='|' read -r t c; do
+    [[ -n $t ]] || continue
+    if [[ $c == -1 ]]; then
+      missing+=("$t")
+      continue
+    fi
+    DRILL_COUNTS=$(jq -c --arg t "$t" --argjson c "$c" '. + {($t): $c}' <<<"$DRILL_COUNTS")
+    line=$(printf '%-16s %s' "$t" "$c")
+    say "    rows: $line"
+  done <<<"$out"
+  if ((${#missing[@]})); then
+    DRILL_ERROR="tables missing in the restored database: ${missing[*]}"
+    return 1
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -1211,7 +1526,7 @@ finish_install() {
     | .applied.config_sha256 = $h | .last_update_utc = $utc | .last_result = "ok" | del(.target)' \
     --arg bt "$T_BTAG" --arg bd "$T_BDIG" --arg ft "$T_FTAG" --arg fd "$T_FDIG" \
     --arg bi "$bi" --arg fimg "$fimg" --argjson h "$CONFIG_HASHES" --arg utc "$(utc_now)"
-  retain_update_dumps
+  retain_dumps update
   local rel_b
   rel_b=$(sed -n 's/^BACKEND_TAG=//p' "$RELEASE_FILE" | tr -d '\r"')
   if [[ $KIND != update || -n $RESTORE_DUMP ]] && [[ $rel_b != "$T_BTAG" ]]; then
@@ -1247,8 +1562,12 @@ Commands:
   status            release, containers, air, pending maintenance, backups, disk
   logs [<service>]  the last run log, or the container logs of a service
   compose <args>    docker compose with the production files (diagnostics only)
-  backup, restore-drill
-                    Phase D6 (not implemented yet)
+  backup            the daily backup: database dump, journal copy, Windows copy,
+                    retention (radio-backup.timer runs it at 04:30)
+  restore-drill [<dump>]
+                    restore the newest daily dump (or <dump>) into a scratch
+                    database, check it, drop it (monthly; never touches the
+                    production database)
 
 Options:
   --dry-run   print every step and change nothing
@@ -1269,6 +1588,7 @@ cmd_update() {
     return
   fi
   preflight
+  report_backup_failure
   fetch_repo
   if (($# == 0)); then
     declare -A REL=()
@@ -1304,15 +1624,12 @@ cmd_restore() {
   (($# <= 1)) || die "restore takes at most one dump"
   installed || die "no release is installed"
   preflight
-  local dump=${1:-$(state_get '.last_dump // empty')}
-  [[ -n $dump ]] || die "no dump is recorded; name one: radioctl restore <dump>"
-  if [[ ! -f $dump && -f $(envv BACKUP_ROOT)/$dump ]]; then
-    dump=$(envv BACKUP_ROOT)/$dump
-  fi
-  if [[ ! -f $dump && -n $(envv BACKUP_WINDOWS_COPY) && -f $(envv BACKUP_WINDOWS_COPY)/$dump ]]; then
-    dump=$(envv BACKUP_WINDOWS_COPY)/$dump
-  fi
-  [[ -f $dump ]] || die "dump not found: $dump"
+  local name=${1:-$(state_get '.last_dump // empty')} dump
+  [[ -n $name ]] || die "no dump is recorded; name one: radioctl restore <dump>"
+  # A path, update/... or daily/..., or a bare name, in BACKUP_ROOT or the
+  # Windows copy (the last_dump of a lost BACKUP_ROOT is found there too).
+  dump=$(find_dump "$name") || dump=$(find_dump "$(basename "$name")") ||
+    die "dump not found: $name"
   load_current
   step "Restore $(basename "$dump") (taken $(dump_time "$dump"))"
   say "The database is replaced by this dump; every change since then is lost."
@@ -1692,10 +2009,31 @@ cmd_first_run() {
   say "Log: $LOG_REL"
 }
 
-# enable_backup_timer: D6 boundary (radio-backup.timer and the first
-# backup, plan 6.8 step 7).
+# enable_backup_timer: plan 6.8 step 7. The units (install/systemd/) are
+# installed and enabled as root by setup-distro.sh through
+# install/systemd/install-units.sh (D4); radioctl runs as radio, so it only
+# checks them here, then runs the first backup. A failed first backup is a
+# warning: the stack runs, and status shows it.
 enable_backup_timer() {
-  say "    the daily backup timer and the first backup are Phase D6 (not done by this version)"
+  local u
+  if ! command -v systemctl >/dev/null 2>&1; then
+    say "    systemctl not found (not a systemd host): the backup timers are not checked"
+  else
+    for u in radio-backup.timer radio-restore-drill.timer; do
+      if systemctl is-enabled --quiet "$u" >&5 2>&5; then
+        say "    $u enabled"
+      else
+        warn "$u is not enabled; as root run install/systemd/install-units.sh (install.bat does it)"
+      fi
+    done
+  fi
+  run_backup || warn "the first backup failed; see $LOG_REL ('update.bat status' shows the last backup)"
+}
+
+# report_backup_failure: a failed daily backup is shown by the next update.
+report_backup_failure() {
+  [[ $(state_get '.last_backup.result // empty') == failed ]] || return 0
+  warn "the last daily backup failed at $(state_get .last_backup.utc): $(state_get '.last_backup.error // "unknown"'); see $(state_get '.last_backup.log // "logs/"')"
 }
 
 cmd_status() {
@@ -1751,9 +2089,7 @@ cmd_status() {
     while IFS= read -r line; do say "    $line"; done <<<"$p"
   fi
 
-  say "Backups"
-  say "    last update dump $(state_get '.last_dump // "none"')"
-  say "    last daily backup $(state_get '.last_backup_utc // "none (D6)"')"
+  status_backups
 
   say "Disk"
   local path pct
@@ -1780,6 +2116,110 @@ cmd_status() {
   fi
 }
 
+# age_s <UTC ISO time>: seconds since then (empty if unparsable).
+age_s() {
+  local t
+  t=$(jq -rn --arg t "$1" '$t | fromdateiso8601' 2>/dev/null) || return 0
+  printf '%s' "$(($(now) - t))"
+}
+
+status_backups() {
+  local res age w
+  say "Backups"
+  res=$(state_get '.last_backup.result // empty')
+  case $res in
+    ok)
+      say "    last daily backup $(state_get .last_backup.utc) ok: $(basename "$(state_get .last_backup.dump)"), journal $(state_get '.last_backup.journal // "?"'), Windows copy $(state_get '.last_backup.windows_copy // "?"')"
+      while IFS= read -r w; do
+        [[ -n $w ]] && say "      warning: $w"
+      done < <(state_get '.last_backup.warnings // [] | .[]')
+      ;;
+    failed)
+      say "    last daily backup FAILED at $(state_get .last_backup.utc): $(state_get '.last_backup.error // "unknown"') (log $(state_get '.last_backup.log // "?"'))"
+      say "    last successful backup $(state_get '.last_backup_utc // "none"')"
+      ;;
+    *) say "    last daily backup $(state_get '.last_backup_utc // "none"')" ;;
+  esac
+  if [[ -n $(state_get '.last_backup_utc // empty') ]]; then
+    age=$(age_s "$(state_get .last_backup_utc)")
+    if [[ -n $age ]] && ((age > 26 * 3600)); then
+      say "    OVERDUE: no successful daily backup for $((age / 3600)) hours (radio-backup.timer runs it at 04:30)"
+    fi
+  fi
+  say "    last update dump $(state_get '.last_dump // "none"')"
+  res=$(state_get '.last_drill.result // empty')
+  case $res in
+    ok) say "    last restore drill $(state_get .last_drill.utc) ok: $(basename "$(state_get .last_drill.dump)"), schema version $(state_get .last_drill.schema_version)" ;;
+    failed) say "    last restore drill FAILED at $(state_get .last_drill.utc): $(state_get '.last_drill.error // "unknown"') (log $(state_get '.last_drill.log // "?"'))" ;;
+    *) say "    last restore drill never (monthly: radio-restore-drill.timer, or 'update.bat restore-drill')" ;;
+  esac
+  if [[ $res == ok ]]; then
+    age=$(age_s "$(state_get .last_drill.utc)")
+    if [[ -n $age ]] && ((age > 35 * 86400)); then
+      say "    DUE: the last successful restore drill is $((age / 86400)) days old"
+    fi
+  fi
+}
+
+cmd_backup() {
+  (($# == 0)) || die "backup takes no arguments"
+  load_env || die ".env is missing: this machine has no first run yet"
+  check_env_vars
+  [[ -f $APPLIED_ENV && -f $NETWORK_ENV ]] ||
+    die "runtime/applied.env or runtime/network.env is missing: nothing is installed yet"
+  run_backup || exit 1
+}
+
+cmd_restore_drill() {
+  (($# <= 1)) || die "restore-drill takes at most one dump"
+  load_env || die ".env is missing: this machine has no first run yet"
+  check_env_vars
+  [[ -f $APPLIED_ENV && -f $NETWORK_ENV ]] ||
+    die "runtime/applied.env or runtime/network.env is missing: nothing is installed yet"
+  [[ $(envv POSTGRES_DB) != "$DRILL_DB" ]] ||
+    die "POSTGRES_DB is $DRILL_DB, the scratch database of the drill; refused"
+  local dump
+  if (($#)); then
+    dump=$(find_dump "$1") || die "dump not found: $1"
+  elif ! dump=$(newest_daily_dump); then
+    drill_failed "" "no daily dump in $(envv BACKUP_ROOT)/daily (run 'update.bat backup' first)"
+  fi
+  step "Restore drill: $(basename "$dump") (taken $(dump_time "$dump"))"
+  say "    into the scratch database $DRILL_DB; the production database $(envv POSTGRES_DB) is not touched"
+  if $DRY_RUN; then
+    say "    [dry-run] DROP DATABASE IF EXISTS $DRILL_DB; CREATE DATABASE $DRILL_DB"
+    say "    [dry-run] pg_restore -d $DRILL_DB < $dump"
+    say "    [dry-run] check schema_migrations and the rows of ${DRILL_TABLES[*]}"
+    say "    [dry-run] DROP DATABASE $DRILL_DB"
+    return 0
+  fi
+  wait_healthy db 120 || drill_failed "$dump" "the database container (db) is not healthy"
+  local dropped=true
+  drill_run "$dump" || true
+  log "+ DROP DATABASE IF EXISTS $DRILL_DB"
+  if drill_sql postgres "DROP DATABASE IF EXISTS $DRILL_DB WITH (FORCE)" >&5; then
+    say "    scratch database $DRILL_DB dropped"
+  else
+    dropped=false
+    warn "the scratch database $DRILL_DB could not be dropped; see $LOG_REL"
+  fi
+  [[ -z $DRILL_ERROR ]] || drill_failed "$dump" "$DRILL_ERROR"
+  state_set '.last_drill = {utc: $u, result: "ok", dump: $d, schema_version: ($v | tonumber),
+      counts: $c, scratch_dropped: $dr, log: $log}' \
+    --arg u "$(utc_now)" --arg d "$dump" --arg v "$DRILL_VERSION" --argjson c "$DRILL_COUNTS" \
+    --argjson dr "$dropped" --arg log "$LOG_REL"
+  say "Restore drill passed: $(basename "$dump") restores, schema version $DRILL_VERSION. Log: $LOG_REL"
+}
+
+# drill_failed <dump> <reason>: records it and exits 1.
+drill_failed() {
+  state_set '.last_drill = {utc: $u, result: "failed", dump: (if $d == "" then null else $d end), error: $e, log: $log}' \
+    --arg u "$(utc_now)" --arg d "$1" --arg e "$2" --arg log "$LOG_REL"
+  printf 'ERROR: restore drill FAILED: %s. The production database was not touched. Send the log %s to the developer.\n' "$2" "$LOG_REL" >&4
+  log "ERROR: restore drill failed: $2"
+  exit 1
+}
+
 cmd_logs() {
   if (($# == 0)); then
     local last
@@ -1797,10 +2237,6 @@ cmd_compose() {
   load_env || die ".env is missing"
   [[ -f $APPLIED_ENV ]] || die "runtime/applied.env is missing: nothing is installed"
   dc "$@"
-}
-
-cmd_d6() {
-  die "'$1' is Phase D6 and not implemented in this version"
 }
 
 main() {
@@ -1831,7 +2267,15 @@ main() {
     status) cmd_status "$@" ;;
     logs) cmd_logs "$@" ;;
     compose) cmd_compose "$@" ;;
-    backup | restore-drill) cmd_d6 "$CMD" ;;
+    backup | restore-drill)
+      # The log first: a timer run that cannot take the lock (an update
+      # runs) leaves its reason in a run log too.
+      mkdir -p "$LOG_DIR"
+      open_log "$CMD"
+      take_lock
+      $DRY_RUN && say "DRY RUN: nothing is changed."
+      "cmd_${CMD//-/_}" "$@"
+      ;;
     update | rollback | restore | maintenance | cutover | first-run)
       mkdir -p "$LOG_DIR"
       take_lock
