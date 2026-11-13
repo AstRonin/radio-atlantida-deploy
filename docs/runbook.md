@@ -91,10 +91,14 @@ Options before the command: `--dry-run` (show every step, change nothing),
 - RAM: 16 GB recommended. The Linux part of the station (the WSL virtual
   machine) gets half of the RAM, at least 4 GB and at most 16 GB (8 GB on a
   16 GB machine). With less than 16 GB the installer warns but continues.
-- An SSD with **at least 40 GB free** on the drive of the install folder
-  (default `C:\RadioAtlantida`). The virtual disk there holds the Docker
-  images, the database, the journal, and the backups; it grows and does not
-  shrink by itself. The media folder is separate (it stays where it is).
+- An SSD with **at least 20 GB free** on the drive of the install folder
+  (default `C:\RadioAtlantida`); more is recommended for growth. The
+  virtual disk there holds the Docker images, the database, the journal,
+  and the backups. About 15-20 GB of it is really used; it grows with the
+  database and the backups and does not shrink by itself. The media folder
+  is separate (it stays where it is). With less free space the install
+  stops; `install.bat -MinFreeGB <GB>` lowers the minimum on purpose (it
+  warns and continues). An existing installation only warns.
 - Internet access. The station streams to the external Icecast server over
   the internet, so the internet connection is part of the air chain.
 - **Docker Desktop must not be installed.** Uninstall it first if it is.
@@ -251,6 +255,7 @@ Options of `install.bat` (type them after `install.bat`):
 | `-MediaFolder "D:\Radio\media"` | the media folder, without the question |
 | `-InstallRoot D:\RadioAtlantida` | install folder (default `C:\RadioAtlantida`); the virtual disk goes to `<InstallRoot>\wsl` |
 | `-ActiveHoursStart 6 -ActiveHoursEnd 0` | the active hours, without the question |
+| `-MinFreeGB 15` | the free space a first install needs (default 20 GB); a lower value continues on purpose, with a warning |
 
 Every run writes a log: `C:\ProgramData\RadioAtlantida\logs\install-<UTC time>.log`.
 The finished steps are recorded in `C:\ProgramData\RadioAtlantida\install-state.json`.
@@ -259,7 +264,7 @@ The finished steps are recorded in `C:\ProgramData\RadioAtlantida\install-state.
 
 | Step | What |
 |------|------|
-| Preflight | checks Windows build and update level, edition, newest update (KB) and its date, ESU status (only logged; an old patch level only warns), 64-bit, virtualization, signed in as `radio`, no Docker Desktop, 40 GB free, internet (Ubuntu images, Docker, GHCR, GitHub); on Windows 10 it shows the support note once |
+| Preflight | checks Windows build and update level, edition, newest update (KB) and its date, ESU status (only logged; an old patch level only warns), 64-bit, virtualization, signed in as `radio`, no Docker Desktop, 20 GB free (`-MinFreeGB`), internet (Ubuntu images, Docker, GHCR, GitHub); on Windows 10 it shows the support note once |
 | Windows features | turns on "Windows Subsystem for Linux" and "Virtual Machine Platform"; restart and resume if needed |
 | WSL | `wsl --update` (the Microsoft Store WSL), WSL 2 as default, at least the version pinned in `install/versions.env` |
 | Network mode | Windows 11 22H2 or later: mirrored; otherwise NAT |
@@ -384,8 +389,8 @@ it keeps retrying; check 10.4 ("Liquidsoap not connected"), or undo.
   results), `OVERDUE` if no backup succeeded for 26 hours, the last update
   dump, the last restore drill, `DUE` if the last good drill is older than
   35 days.
-- **Disk**: free space of the deploy folder, the backups, and the media
-  folder; `LOW SPACE` below 15 %.
+- **Disk**: free space (percent and GB) of the deploy folder, the backups,
+  and the media folder; `LOW SPACE` below 15 %.
 - **Media**: `ok`, `MISSING` (the drive is not there), or `NOT WRITABLE`.
 
 Look at it once a day, and after every restart.

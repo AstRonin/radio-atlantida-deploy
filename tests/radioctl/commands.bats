@@ -242,6 +242,8 @@ first_run_setup() {
   assert_contains "$output" "control link true, output connected, queued 3"
   assert_contains "$output" "liquidsoap image a -> b"
   assert_contains "$output" "$ROOT/media ok"
+  local re='[0-9]+% free, [0-9]+\.[0-9] GB'
+  [[ $output =~ $re ]]
 }
 
 @test "status reports a missing media mount" {

@@ -2130,15 +2130,16 @@ cmd_status() {
   status_backups
 
   say "Disk"
-  local path pct
+  local path pct gb
   for path in "$ROOT" "$(envv BACKUP_ROOT)" "$(envv MEDIA_ROOT)"; do
     [[ -e $path ]] || continue
-    line=$(df -P "$path" 2>/dev/null | tail -n 1) || continue
+    line=$(df -Pk "$path" 2>/dev/null | tail -n 1) || continue
     pct=$(awk '{gsub("%", "", $5); print $5}' <<<"$line")
+    gb=$(awk '{printf "%.1f", $4 / 1048576}' <<<"$line")
     if ((100 - pct < 15)); then
-      say "    LOW SPACE: $path ($((100 - pct))% free)"
+      say "    LOW SPACE: $path ($((100 - pct))% free, $gb GB)"
     else
-      say "    $path: $((100 - pct))% free"
+      say "    $path: $((100 - pct))% free, $gb GB"
     fi
   done
 

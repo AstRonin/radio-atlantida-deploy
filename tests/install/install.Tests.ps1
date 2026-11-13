@@ -396,9 +396,15 @@ Describe 'install runs' {
             Get-FakeCalls 'dism.exe*' | Should -HaveCount 2
             $script:Fake.Tasks[$script:ResumeTaskName] | Should -Match '<LogonTrigger>'
             $script:Fake.Tasks[$script:ResumeTaskName] | Should -Match '-Resume'
+            $script:Fake.Tasks[$script:ResumeTaskName] | Should -Not -Match 'MinFreeGB'
             $script:Fake.Restarted | Should -BeTrue
             Get-FakeCalls 'wsl.exe*' | Should -HaveCount 0
             (Get-SavedState).steps.Keys | Should -Contain 'features'
+        }
+
+        It 'the resume task keeps an explicit -MinFreeGB' {
+            Invoke-TestInstall -Options @{ MinFreeGB = 15 } | Should -Be 3010
+            $script:Fake.Tasks[$script:ResumeTaskName] | Should -Match '-Resume -InstallRoot .* -MinFreeGB 15'
         }
 
         It 'after the restart, -Resume removes the resume task and installs everything' {
@@ -537,7 +543,7 @@ Describe 'install runs' {
             @{ Why = 'virtualization off'; Set = { $script:Fake.Hardware.VirtualizationFirmwareEnabled = $false }; Msg = '*virtualization is off*' },
             @{ Why = 'Docker Desktop'; Set = { $script:Fake.DockerDesktop = $true }; Msg = '*Docker Desktop is installed*' },
             @{ Why = 'the wrong account'; Set = { $script:Fake.Account = 'manager' }; Msg = "*signed in as the local account 'radio' (now: 'manager')*install.bat -CreateAccount*" },
-            @{ Why = 'too little disk space'; Set = { $script:Fake.FreeGB = 39 }; Msg = '*39 GB free*at least 40 GB*' },
+            @{ Why = 'too little disk space'; Set = { $script:Fake.FreeGB = 19 }; Msg = '*19 GB free*at least 20 GB*-MinFreeGB*' },
             @{ Why = 'ARM64 Windows'; Set = { $script:Fake.Os.Architecture = 'ARM64' }; Msg = '*64-bit x86*' }
         ) {
             & $Set
@@ -635,6 +641,36 @@ Describe 'install runs' {
             Invoke-TestInstall | Should -Be 1
             Get-RunLog | Should -Match 'STOPPED: setup-distro.sh failed \(exit 1\); its output is in .*install-.*\.log'
             Get-FakeCalls 'REGISTER*' | Should -HaveCount 0
+        }
+
+        It 'free space: 20 GB is the default minimum of a first install' {
+            $script:Fake.FreeGB = 20
+            Invoke-TestInstall | Should -Be 0
+            $script:Ctx.MinFreeGB | Should -Be 20
+            Get-RunLog | Should -Not -Match 'MinFreeGB'
+        }
+
+        It 'free space: -MinFreeGB lower lets a first install continue, with a warning' {
+            $script:Fake.FreeGB = 12
+            Invoke-TestInstall -Options @{ MinFreeGB = 10 } | Should -Be 0
+            $log = Get-RunLog
+            $log | Should -Match 'WARNING: -MinFreeGB 10: the free space check is lowered below the recommended 20 GB'
+            $log | Should -Match '12 GB free'
+            $script:Fake.Distros | Should -Contain 'radio-atlantida'
+        }
+
+        It 'free space: a fresh install stops below an explicit -MinFreeGB' {
+            $script:Fake.FreeGB = 25
+            Invoke-TestInstall -Options @{ MinFreeGB = 30 } | Should -Be 1
+            Get-RunLog | Should -BeLike '*STOPPED: 25 GB free*at least 30 GB*'
+            Get-FakeCalls 'wsl.exe --import*' | Should -HaveCount 0
+        }
+
+        It 'free space: an existing distribution only warns below the minimum' {
+            $script:Fake.Distros = @('radio-atlantida')
+            $script:Fake.FreeGB = 5
+            Invoke-TestInstall | Should -Be 0
+            Get-RunLog | Should -Match 'WARNING: 5 GB free on the drive of'
         }
 
         It 'a restart of the distribution on an installed station needs a yes; no means stop' {

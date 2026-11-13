@@ -45,6 +45,10 @@
     The dedicated local account (default radio).
 .PARAMETER RepoUrl
     The public deploy repository cloned inside WSL.
+.PARAMETER MinFreeGB
+    Free space in GB the drive of InstallRoot needs for a first install
+    (default 20). A lower value lets a first install continue on purpose, with
+    a warning. An existing distribution only warns below it.
 .PARAMETER Elevated
     Internal: set by the self-elevation, so the elevated window waits for
     Enter before it closes.
@@ -61,6 +65,7 @@ param(
     [int]$ActiveHoursEnd = -1,
     [string]$AccountName = 'radio',
     [string]$RepoUrl = 'https://github.com/AstRonin/radio-atlantida-deploy',
+    [ValidateRange(1, 100000)][int]$MinFreeGB = 20,
     [switch]$Elevated
 )
 
@@ -84,8 +89,10 @@ $script:MirroredBuild = 22621
 # Free space on the drive of the distribution's virtual disk: Docker images
 # (two releases during an update), the database, the journal, and the
 # backups (14 daily and 14 update dumps, 3 boundary dumps, journal copies)
-# live there; the media folder does not (it stays on Windows, 6.6).
-$script:MinFreeGB = 40
+# live there; the media folder does not (it stays on Windows, 6.6). About
+# 15-20 GB is really used; 20 GB is the minimum, more is recommended for
+# growth. -MinFreeGB overrides it (a lower value warns).
+$script:DefaultMinFreeGB = 20
 $script:MinRamGB = 16
 # The WSL VM's memory (.wslconfig, plan 6.4): half the RAM, at least 4 GB,
 # at most 16 GB (8 GB on a 16 GB machine).
@@ -953,7 +960,10 @@ function Initialize-Context {
     $repo = $PSScriptRoot
     $stateDir = ''
     if ($env:ProgramData) { $stateDir = Join-Path $env:ProgramData 'RadioAtlantida' }
+    $minFree = $script:DefaultMinFreeGB
+    if ($Options.ContainsKey('MinFreeGB') -and [int]$Options['MinFreeGB'] -gt 0) { $minFree = [int]$Options['MinFreeGB'] }
     $ctx = @{
+        MinFreeGB        = $minFree
         DryRun           = [bool]$Options['DryRun']
         Resume           = [bool]$Options['Resume']
         Yes              = [bool]$Options['Yes']
@@ -1058,9 +1068,13 @@ function Invoke-Preflight {
     if (Test-DockerDesktop) { Stop-Install 'Docker Desktop is installed: uninstall it first (it competes for WSL and the ports)' }
 
     $free = Get-FreeSpaceGB -Path $script:Ctx.InstallRoot
-    if ($free -lt $script:MinFreeGB) {
+    $minFree = $script:Ctx.MinFreeGB
+    if ($minFree -lt $script:DefaultMinFreeGB) {
+        Write-Warn ("-MinFreeGB {0}: the free space check is lowered below the recommended {1} GB on purpose; the station needs about 15-20 GB and more as it grows" -f $minFree, $script:DefaultMinFreeGB)
+    }
+    if ($free -lt $minFree) {
         if (Test-DistroExists) { Write-Warn "$free GB free on the drive of $($script:Ctx.InstallRoot)" }
-        else { Stop-Install "$free GB free on the drive of $($script:Ctx.InstallRoot); at least $($script:MinFreeGB) GB are needed" }
+        else { Stop-Install "$free GB free on the drive of $($script:Ctx.InstallRoot); at least $minFree GB are needed (install.bat -MinFreeGB <GB> lowers it on purpose)" }
     }
     $failed = @()
     foreach ($u in $script:ReachableUrls) { if (-not (Test-UrlReachable -Url $u)) { $failed += $u } }
@@ -1095,7 +1109,9 @@ function Invoke-Features {
     if (-not $reboot) { return 'done' }
     $cmd = Get-CmdExe
     $bat = Join-Path $script:Ctx.RepoRoot 'install.bat'
-    $arguments = ('/c ""{0}" -Resume -InstallRoot "{1}""' -f $bat, $script:Ctx.InstallRoot)
+    $extra = ''
+    if ($script:Ctx.MinFreeGB -ne $script:DefaultMinFreeGB) { $extra = ' -MinFreeGB {0}' -f $script:Ctx.MinFreeGB }
+    $arguments = ('/c ""{0}" -Resume -InstallRoot "{1}"{2}"' -f $bat, $script:Ctx.InstallRoot, $extra)
     Register-TaskFromXml -Name $script:ResumeTaskName -Xml (New-ResumeTaskXml -UserId (Get-KeepAliveUserId) -Command $cmd -Arguments $arguments)
     Write-Info '    Windows must restart to finish enabling WSL. After the restart, sign in as'
     Write-Info ('    {0}: the install continues by itself (task "{1}").' -f $script:Ctx.AccountName, $script:ResumeTaskName)
@@ -1576,6 +1592,7 @@ function Invoke-Main {
     $opts = @{
         DryRun = $DryRun; Resume = $Resume; Yes = $Yes; InstallRoot = $InstallRoot; MediaFolder = $MediaFolder
         ActiveHoursStart = $ActiveHoursStart; ActiveHoursEnd = $ActiveHoursEnd; AccountName = $AccountName; RepoUrl = $RepoUrl
+        MinFreeGB = $MinFreeGB
     }
     $code = 1
     try {
