@@ -703,6 +703,7 @@ Sign in as `radio` and run `update.bat status`.
 | An update ends with "failed and was undone" | the log named in the message | send it to the developer; the station runs on the previous release |
 | "health timeout" | `update.bat logs backend` | the update was undone automatically; send the update log |
 | Liquidsoap not connected to the server | `update.bat logs liquidsoap`: `401`/`403 Forbidden` = wrong password or the mount is busy (the old source still connected); TLS or certificate errors = the server's certificate; connection refused/timeouts = internet or server down | wrong password: see the note below; busy mount: stop the old source; server down: ask the server's owner. The panel shows an outage meanwhile |
+| `update.bat logs liquidsoap` shows "crash-loop guard: N starts in a row ended within 30.0 s" | Liquidsoap exited N times in a row soon after starting and has fallen back to the stream output from `.env`; the stream settings in the panel (codec, bitrate, sample rate, server) | check the stream settings and send the Liquidsoap log to the developer |
 | Non-Latin titles show as `*` | the mount's charset | ask the server's owner for `<charset>UTF-8</charset>` (1.5) |
 | `OVERDUE` backups | `logs\backup-*.log` (the newest) | run `update.bat backup`; if it fails again, send the log |
 | `LOW SPACE` | `update.bat status`, Disk | free space on that Windows drive; see 8.3 for old dumps |

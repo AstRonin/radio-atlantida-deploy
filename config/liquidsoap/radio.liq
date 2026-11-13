@@ -18,7 +18,9 @@
 #     runtime by `output.set <json>` (§8.8): read at startup from
 #     BACKEND_OUTPUT_URL, else from OUTPUT_STATE_FILE (the last output that
 #     connected), else from the environment; plain or TLS; its connection
-#     state reported to the backend;
+#     state reported to the backend; a crash-loop guard that starts with
+#     the environment output after three quick starts in a row; an
+#     output.dummy that keeps the sources awake while the output changes;
 #   - a UTC playout journal and an HTTP callback on every track start and end;
 #   - a heartbeat callback every 5 seconds, for the outage detector.
 #
@@ -361,6 +363,22 @@ live =
 duck_gain = interactive.float("duck_gain", min=0., max=1., 0.2)
 radio = smooth_add(duration=0.5, p=duck_gain, normal=automation, special=live)
 
+# `radio` has an output of its own for the whole run, so it never goes to
+# sleep. output.set below shuts the old Icecast output down and starts a
+# new one; when the shutdown is processed before the new output wakes up
+# (two switches in quick succession, or a loaded host), `radio` has no
+# active output for a moment and Liquidsoap puts the whole graph to sleep:
+# the harbor input closes port 8005 and the new output reopens it at once.
+# The bind then fails with EADDRINUSE and Liquidsoap exits with code 2
+# (seen 2026-11-13: "Nothing more on port 8005: closing sockets", then
+# "Error while starting source live: Unix.Unix_error(Unix.EADDRINUSE,
+# "bind", "")"). Sleeping would also restart the queues and the emergency
+# source. The dummy output encodes nothing and reads the frames the
+# Icecast output reads (one clock, each source fills a frame once per
+# tick), so the track callbacks and the journal fire once, as before. No
+# telnet commands: it must not be stopped by hand.
+output.dummy(id="keepalive", register_telnet=false, radio)
+
 # --- Stream output (§8.8) -----------------------------------------------
 
 # The Icecast output is a backend setting group (stream.*) applied at
@@ -644,8 +662,56 @@ env_output =
     genre=""
   }
 
+# Crash-loop guard: a start that ends (Liquidsoap exits, the container
+# restarts it) within quick_start_s seconds is a quick start. The count of
+# quick starts in a row is kept next to the state file: raised at every
+# start, reset to 0 once this run has lived quick_start_s. After
+# max_quick_starts of them the startup output is the environment one, not
+# the backend's nor the state file's, which may be what makes Liquidsoap
+# exit; the backend corrects it with output.set as usual. Logged at level 1
+# with "crash-loop guard", for a log alert.
+startup_count_file = path.dirname(output_state_file) ^ "/quick-starts"
+quick_start_s = 30.
+max_quick_starts = 3
+
+def save_quick_starts(n) =
+  try
+    file.write(
+      atomic=true,
+      temp_dir=path.dirname(output_state_file),
+      data=string(n),
+      startup_count_file
+    )
+  catch err do
+    log.info(label="output", "quick start count not saved: #{err.message}")
+  end
+end
+
+quick_starts =
+  try
+    if
+      file.exists(startup_count_file)
+    then
+      int_of_string(default=0, string.trim(file.contents(startup_count_file)))
+    else
+      0
+    end
+  catch _ do
+    0
+  end
+save_quick_starts(quick_starts + 1)
+thread.run(delay=quick_start_s, fun () -> save_quick_starts(0))
+
 initial_output =
-  begin
+  if
+    quick_starts >= max_quick_starts
+  then
+    log.critical(
+      label="output",
+      "crash-loop guard: #{quick_starts} starts in a row ended within #{quick_start_s} s; startup output from the environment"
+    )
+    env_output
+  else
     b = backend_output()
     if
       null.defined(b)

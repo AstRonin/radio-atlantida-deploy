@@ -218,6 +218,20 @@ setup() { common_setup; }
   refute_contains "$output" "liquidsoap"
 }
 
+@test "a changed radio.liq with the same contract becomes pending; liquidsoap is not restarted" {
+  echo '# a script fix without an interface change' >>"$ROOT/config/liquidsoap/radio.liq"
+  run radioctl update
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "pending: liquidsoap script config/liquidsoap/radio.liq changed"
+  refute_contains "$output" "script contract"
+  assert_contains "$output" "Run 'update.bat maintenance'"
+  run calls
+  refute_contains "$output" "liquidsoap"$'\n'
+  run events
+  refute_contains "$output" "liquidsoap"
+  [ "$(st '.pending_maintenance[0]')" = "liquidsoap script config/liquidsoap/radio.liq changed" ]
+}
+
 @test "a changed db image becomes pending; db is not restarted" {
   stub_out compose_config '{"services":{"liquidsoap":{"image":"savonet/liquidsoap:v2.4.6","command":["/etc/liquidsoap/radio.liq"]},"db":{"image":"postgres:17.12"}}}'
   run radioctl update

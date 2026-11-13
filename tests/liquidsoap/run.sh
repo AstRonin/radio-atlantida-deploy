@@ -8,8 +8,11 @@
 #      service against a test Icecast, plain and behind a TLS proxy, with a
 #      stub backend: startup output from the backend, OK unchanged,
 #      refusals, every codec x channels x sample rate at the lowest and
-#      highest bitrate and on both sides of every encoder limit, TLS, and a
-#      restart from the state file with the backend down.
+#      highest bitrate and on both sides of every encoder limit, 30 rapid
+#      output switches (case 4b: Liquidsoap keeps running and harbor port
+#      8005 keeps listening), TLS, a restart from the state file with the
+#      backend down, and the crash-loop guard (case 7: after three quick
+#      starts the environment output, then output.set applies).
 # `liquidsoap --check` alone is not enough: it accepts scripts that fail
 # only when an encoder starts (5.2).
 #
