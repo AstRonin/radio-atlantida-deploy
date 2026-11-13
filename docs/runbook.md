@@ -140,15 +140,18 @@ port are reachable from this PC only, never from the network. Therefore:
 | Item | From | Notes |
 |------|------|-------|
 | GitHub user name and **read-only token** for the images | the developer | a fine-grained token, read-only on the `radio-atlantida-*` packages; write its **expiry date** in 1.6 |
-| The **Icecast source password** of the mount `/atlantida` | the stream server's owner | typed once, kept in the station's `.env` |
+| The **Icecast source password** of the station's mount (today `/atlantida`, 1.5) | the stream server's owner | typed once, kept in the station's `.env` |
 | Where the station's tracks are | you | the Windows folder of tracks, for example `D:\RadioAtlantida\media` |
 | A password for the Windows account `radio` | you choose | needed for the boot task; never expires |
 
 ### 1.5 The external Icecast server
 
-The station streams to `https://listen.teploe.net:8001/atlantida`
-(Icecast 2.4.4). There is no Icecast on the station PC. For the operator
-and the server's owner:
+The station streams to an external Icecast server; there is no Icecast on
+the station PC. Which server is a panel setting (below), so the server may
+move without a change to this repository (10.7). Today, and the default the
+first run proposes, it is `https://listen.teploe.net:8001/atlantida`
+(Icecast 2.4.4). For the operator and the server's owner, about that
+server:
 
 - **TLS on port 8001.** Port 8001 accepts TLS only (plain HTTP is reset).
   The station's source connection and the outage detector's
@@ -163,11 +166,14 @@ and the server's owner:
 - **Outages.** The station watches the server. If the server or the
   internet connection fails, the panel shows an outage, and the items
   planned during it are marked missed.
-- The stream format (host, port, mount, TLS, codec, bitrate, sample rate,
+- The stream output (host, port, mount, TLS, codec, bitrate, sample rate,
   channels, name, description, genre) is set in the panel under
-  **"Stream output (Icecast)"**, not in files. The first run writes
-  `listen.teploe.net`, `8001`, `/atlantida`, TLS on, MP3, 160 kbps,
-  44100 Hz, stereo, "Radio Atlantida" (the format of the current stream).
+  **"Stream output (Icecast)"**; after the first run those settings are the
+  only source of truth. The first run proposes the values of
+  `config/stream-defaults.json`: today `listen.teploe.net`, `8001`,
+  `/atlantida`, TLS on, MP3, 160 kbps, 44100 Hz, stereo, "Radio Atlantida"
+  (the format of the current stream). You can accept them or edit the
+  host, port, mount, and TLS at that question.
 
 ### 1.6 Record sheet
 
@@ -234,8 +240,9 @@ without anyone signed in.
      Scheduler, for the boot task);
    - then the questions of the first run: the **GHCR user**, the **read
      token**, the **Icecast source password** (none of them is shown or
-     logged), and whether to save the proposed **stream settings** (answer
-     yes).
+     logged), and whether to save the proposed **stream settings** (1.5):
+     `y` saves them, `e` lets you edit the host, port, mount, and TLS first
+     (Enter keeps a value), `n` leaves them for the panel.
 6. At the end the install shows a summary: the Windows build, the network
    mode, the versions installed, the media folder, the next steps, and the
    log file. **The Grafana admin password is shown once**, by the first run,
@@ -313,15 +320,16 @@ All of this is done in the panel ("Radio panel").
 2. **Grid and clocks**: build them, and let the plan cover at least the next
    24 hours.
 3. **Emergency playlist**: set it (it plays when nothing else can).
-4. **Stream settings**: "Stream output (Icecast)" shows the values of 1.5.
-   Leave them for the cut-over.
+4. **Stream settings**: "Stream output (Icecast)" shows the values saved at
+   the first run (1.5). Check them with the server's owner; the cut-over
+   uses them as they are.
 
 ---
 
 ## 4. Cut-over to this system, and undo
 
-The mount `/atlantida` carries the old system's stream until you switch.
-Choose a quiet time.
+The station's mount (today `/atlantida`) carries the old system's stream
+until you switch. Choose a quiet time.
 
 ### 4.1 Cut-over
 
@@ -334,13 +342,20 @@ Choose a quiet time.
    ```
 
    It checks that the backend is ready, the plan covers the next 24 hours,
-   an emergency playlist is set, and the stream settings point to
-   `listen.teploe.net:8001/atlantida` with TLS. If something is missing, it
-   lists it and stops; nothing is changed.
-4. Type **`CUTOVER`** when asked. Liquidsoap starts and connects. Within
-   60 seconds it reports `Cut-over done` and the listen address.
-5. **Listen to the stream** (`http://listen.teploe.net:8100/atlantida` in a
-   player, or on another device) and check by ear.
+   an emergency playlist is set, the stream host, port, and mount are set
+   and valid, and the source password is set in `.env` (it says only "set",
+   never the value). If something is missing, it lists it and stops;
+   nothing is changed.
+4. It shows the stream output from the panel: server, port, TLS, mount,
+   codec, bitrate, sample rate, channels, and the source address. **Check
+   them**; if one is wrong, answer anything else, fix it in the panel, and
+   run `update.bat cutover` again. Type **`CUTOVER`** to confirm. Liquidsoap
+   starts and connects. Within 60 seconds it reports `Cut-over done`, the
+   source address, and where the listener address is: the server's status
+   page `https://<host>:<port>/status-json.xsl` (the mount's `listenurl`).
+5. **Listen to the stream** in a player, or on another device, and check by
+   ear. The listener address may differ from the source address; today it
+   is `http://listen.teploe.net:8100/atlantida`.
 6. Write the date and time in the record sheet (1.6).
 
 From now on Liquidsoap starts at every boot like every other service.
@@ -400,6 +415,7 @@ Look at it once a day, and after every restart.
 Change them in the panel under "Stream output (Icecast)". A change applies
 at once, with a gap of a few seconds in the stream; no restart and no
 maintenance window. The panel refuses combinations the encoder cannot run.
+A new server, or a new source password: 10.7.
 
 ### 5.4 Monitoring (Grafana)
 
@@ -509,8 +525,10 @@ These are done in a maintenance window (section 7):
 
 Some changes stop the stream for a few seconds, so they wait for a time
 you choose: a new Liquidsoap image or playout script, a new PostgreSQL
-image, a changed database or Liquidsoap definition. `update.bat` and
-`update.bat status` list them as **pending maintenance**.
+image, a changed database or Liquidsoap definition, a changed Icecast
+source password in `.env` (10.7). `update.bat` and `update.bat status` list
+them as **pending maintenance**; `update.bat maintenance` always checks
+anew.
 
 1. Choose a quiet time (no live voice, nothing important planned).
 2. Run `update.bat maintenance`. It shows the pending changes and the items
@@ -716,11 +734,7 @@ Sign in as `radio` and run `update.bat status`.
 | "Docker Engine is X, install/versions.env pins Y; run install.bat" | a new `versions.env` came with the repository | 6.3 |
 | "another radioctl run holds state.lock" (or it waits) | an update, backup, or drill is running | wait for it to finish |
 
-**Changing the Icecast source password**: Liquidsoap reads it when it
-starts. Edit `ICECAST_SOURCE_PASSWORD` in `.env` (10.6). `update.bat status`
-then lists a pending Liquidsoap change; apply it with
-`update.bat maintenance` (section 7; the stream stops for a few seconds) and
-check that `update.bat status` shows output `connected`.
+**Changing the Icecast source password**: see 10.7, step 3.
 
 ### 10.5 The station PC must be replaced or reinstalled
 
@@ -745,6 +759,62 @@ for the cases in this runbook.
 **Renewing the GHCR read token**: create the new token (the developer
 does), set `GHCR_READ_TOKEN=<new token>` in `.env`, run `update.bat`, and
 write the new expiry date in the record sheet (1.6).
+
+### 10.7 The Icecast server moved or changed
+
+The panel settings "Stream output (Icecast)" are the only record of the
+server; nothing in the station compares them with a fixed address. Only
+the source password lives in `.env`.
+
+How the password works: Liquidsoap gets `ICECAST_SOURCE_PASSWORD` from
+`.env` in its container's environment and reads it once, when it starts.
+A change of the panel settings replaces Liquidsoap's output at once and
+reuses that password. The backend only reports whether it is set. So a new
+password needs Liquidsoap to be recreated (`update.bat maintenance`); a new
+host, port, mount, or TLS needs nothing but the panel.
+
+1. **Ask the server's owner** for: the host, the port that accepts sources,
+   TLS or not, the mount, the source password (if it changed), and the
+   listener address.
+2. **If the password changed**, first edit `.env` (10.6):
+   `ICECAST_SOURCE_PASSWORD=<new password>`. Nothing changes yet: Liquidsoap
+   still runs with the old one.
+3. **Change host, port, mount, and TLS** in the panel under "Stream output
+   (Icecast)" and save. It applies at once: Liquidsoap closes the old
+   connection and opens the new one, a gap of a few seconds. Change the
+   format too if the new mount needs another one.
+4. **If the password changed**, run `update.bat maintenance` right after
+   step 3. It lists `liquidsoap environment changed (.env values it reads
+   at start, e.g. ICECAST_SOURCE_PASSWORD)` (never the value); type
+   **`MAINTENANCE`**. Liquidsoap is recreated with the new password and
+   connects within 60 seconds (section 7). Between steps 3 and 4 the new
+   server refuses the old password (`401`/`403` in `update.bat logs
+   liquidsoap`), so keep that time short. The backend needs no restart
+   (the next `update.bat` recreates it anyway). Before the cut-over,
+   Liquidsoap is not running: `update.bat maintenance` only records the
+   change, and the cut-over starts Liquidsoap with the new password.
+5. **Check** with `update.bat status`: under "Air", output `connected` and
+   broadcast `connected`. Then **listen**: the listener address is on the
+   new server's status page, `https://<host>:<port>/status-json.xsl` (the
+   mount's `listenurl`; `http://` when TLS is off). It may use another port
+   or plain HTTP.
+6. **Charset**: ask the server's owner to set `<charset>UTF-8</charset>` on
+   the new mount (1.5), or non-Latin titles show as `*`.
+
+What the panel shows during the switch: the broadcast state goes to
+`reconnecting` while Liquidsoap is between servers, and back to `connected`
+when it streams to the new one. If the gap lasts longer than the outage
+detector's failed checks allow (a wrong password, a busy mount, a typo in
+the host), an outage opens (`unreachable`), the items planned during it are
+marked missed unless the journal confirms they aired, and the outage closes
+by itself once the mount check finds the stream on the new server. The
+backend checks the mount on the same host, port, and scheme as the source
+connection: if the new server serves its status page only on another port,
+the panel shows an outage although listeners hear the stream; tell the
+developer.
+
+If the server moved for good, also tell the developer, so
+`config/stream-defaults.json` (what a new install proposes) is updated.
 
 ---
 

@@ -18,7 +18,7 @@ backend and frontend run as prebuilt images from GitHub Container Registry.
 | `docker-compose.yml` | the production stack; infrastructure images pinned literally, application images by tag and digest from `runtime/applied.env` |
 | `release.env` | the release this repository installs (`BACKEND_TAG`, `BACKEND_DIGEST`, `FRONTEND_TAG`, `FRONTEND_DIGEST`); a station release is a PR that changes it |
 | `.env.example` | the template of the station's `.env` (written by `radioctl first-run`, never committed) |
-| `config/` | copies of the backend's `dev/` files at the release: `liquidsoap/radio.liq` (+ `production.patch`), `grafana/`, `loki/`, `alloy/`; `backend-source.env` records the backend commit |
+| `config/` | copies of the backend's `dev/` files at the release: `liquidsoap/radio.liq` (+ `production.patch`), `grafana/`, `loki/`, `alloy/`; `backend-source.env` records the backend commit. Also this repository's own `stream-defaults.json`: the stream settings `radioctl first-run` proposes (the current Icecast server; the panel settings are the truth afterwards) |
 | `install.bat`, `install.ps1` | the Windows half of the host install (Windows PowerShell 5.1) |
 | `install/` | the Linux half: `setup-distro.sh`, `wsl.conf`, `radio-keepalive`, the systemd units, `versions.env` (pinned Ubuntu rootfs, Docker Engine, Compose, buildx, WSL) |
 | `update.bat`, `bin/radioctl` | the update tool (bash, inside the WSL distribution) |
@@ -122,8 +122,8 @@ Environment only, never `.env`: `COMPOSE_PROJECT_NAME`,
 `RADIOCTL_BACKEND_IMAGE`, `RADIOCTL_FRONTEND_IMAGE` (a test registry),
 `RADIOCTL_COMPOSE_OVERRIDE` (an extra compose file, e.g.
 `tests/dryrun/compose.override.yml`), `RADIOCTL_STREAM_OVERRIDE` (a JSON
-object merged over the first-run stream settings; the cut-over then expects
-it), `RADIOCTL_HEALTH_TIMEOUT`, `RADIOCTL_LOCK_WAIT`, `RADIOCTL_NET_DEV`,
+object merged over `config/stream-defaults.json`, the stream settings the
+first run proposes; the cut-over uses whatever the panel says), `RADIOCTL_HEALTH_TIMEOUT`, `RADIOCTL_LOCK_WAIT`, `RADIOCTL_NET_DEV`,
 `RADIOCTL_FAKE_CLOCK` and the other test switches listed at the top of
 `bin/radioctl`. `DOCKER_DEFAULT_PLATFORM=linux/amd64` forces amd64 images
 for a parity run.

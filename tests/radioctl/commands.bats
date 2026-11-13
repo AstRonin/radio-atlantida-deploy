@@ -36,6 +36,46 @@ setup() { common_setup; }
   [ "$(st '.pending_maintenance | length')" = 0 ]
 }
 
+# liquidsoap_env <ICECAST_SOURCE_PASSWORD>: the rendered compose config
+# with that liquidsoap environment.
+liquidsoap_env() {
+  stub_out compose_config "$(jq -cn --arg pw "$1" '{services: {liquidsoap: {image: "savonet/liquidsoap:v2.4.6",
+    environment: {TZ: "UTC", ICECAST_SOURCE_PASSWORD: $pw, LIQUIDSOAP_CONTROL_PASSWORD: "ctl"}},
+    db: {image: "postgres:17.11"}, backend: {}, frontend: {}}}')"
+}
+
+@test "a changed source password in .env is a pending liquidsoap change; maintenance applies it" {
+  liquidsoap_env old-secret-1
+  write_state 1.0.0 "$D_B100" 1.0.0 "$D_F100"
+  # A state.json from before the env hash: recorded while nothing changed.
+  run radioctl maintenance
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "Nothing is pending."
+  [ -n "$(st '.applied.liquidsoap_env_sha256 // empty')" ]
+  liquidsoap_env new-secret-2
+  run radioctl maintenance <<<"MAINTENANCE"
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "liquidsoap environment changed (.env values it reads at start, e.g. ICECAST_SOURCE_PASSWORD)"
+  refute_contains "$output" "service definition changed"
+  refute_contains "$output" "new-secret-2"
+  ! grep -rq -e new-secret-2 -e old-secret-1 "$ROOT/logs" "$ROOT/state.json"
+  run calls
+  assert_contains "$output" "up -d --no-deps --force-recreate liquidsoap"
+  run radioctl maintenance
+  assert_contains "$output" "Nothing is pending."
+}
+
+@test "update lists a changed source password as pending maintenance" {
+  liquidsoap_env old-secret-1
+  write_state 1.0.0 "$D_B100" 1.0.0 "$D_F100"
+  run radioctl maintenance
+  liquidsoap_env new-secret-2
+  run radioctl --yes update
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "pending: liquidsoap environment changed"
+  [ "$(st '.pending_maintenance[0]')" = "liquidsoap environment changed (.env values it reads at start, e.g. ICECAST_SOURCE_PASSWORD)" ]
+}
+
 @test "maintenance of db takes a dump first" {
   stub_out compose_config '{"services":{"liquidsoap":{"image":"savonet/liquidsoap:v2.4.6","command":["/etc/liquidsoap/radio.liq"]},"db":{"image":"postgres:17.12"}}}'
   run radioctl maintenance <<<"MAINTENANCE"
@@ -117,20 +157,100 @@ setup() { common_setup; }
   [ -n "$(st '.cutover_utc // empty')" ]
 }
 
-@test "cutover with RADIOCTL_STREAM_OVERRIDE expects the test server (dry run)" {
+cutover_ready() {
   write_state 1.0.0 "$D_B100" 1.0.0 "$D_F100" null false
   api api_track-plan "$(jq -n '{items: [range(24) | {items: [{}]}]}')"
-  export RADIOCTL_STREAM_OVERRIDE='{"stream.icecast_host":"icecast.test","stream.icecast_port":8443,"stream.mount":"/dry"}'
-  run radioctl cutover <<<"CUTOVER"
+}
+
+# stream_api <host> <port> <mount> <tls>: the panel's stream settings.
+stream_api() {
+  api api_settings "$(jq -n --arg h "$1" --argjson p "$2" --arg m "$3" --argjson t "$4" '{items: [
+    {key: "playout.emergency_playlist_id", value: 7},
+    {key: "stream.icecast_host", value: $h}, {key: "stream.icecast_port", value: $p},
+    {key: "stream.mount", value: $m}, {key: "stream.icecast_tls", value: $t},
+    {key: "stream.codec", value: "aac"}, {key: "stream.bitrate_kbps", value: 128},
+    {key: "stream.sample_rate_hz", value: 48000}, {key: "stream.channels", value: 1}]}')"
+}
+
+@test "cutover with another server shows the output and passes after confirmation" {
+  cutover_ready
+  stream_api radio.other.example 8100 /live false
+  run radioctl cutover <<<"no"
   [ "$status" -eq 1 ]
-  assert_contains "$output" "not ready: stream.icecast_host is 'listen.teploe.net', expected 'icecast.test'"
-  assert_contains "$output" "not ready: stream.mount is '/atlantida', expected '/dry'"
-  api api_settings '{"items":[{"key":"playout.emergency_playlist_id","value":7},
-    {"key":"stream.icecast_host","value":"icecast.test"},{"key":"stream.icecast_port","value":8443},
-    {"key":"stream.mount","value":"/dry"},{"key":"stream.icecast_tls","value":true}]}'
+  assert_contains "$output" "server    radio.other.example, port 8100, TLS off"
+  assert_contains "$output" "mount     /live"
+  assert_contains "$output" "format    aac, 128 kbps, 48000 Hz, 1 channel(s)"
+  assert_contains "$output" "source    http://radio.other.example:8100/live"
+  assert_contains "$output" "source password (ICECAST_SOURCE_PASSWORD): set"
+  assert_contains "$output" "Start liquidsoap and stream to http://radio.other.example:8100/live with these settings now?"
+  run events
+  refute_contains "$output" "liquidsoap"
   run radioctl cutover <<<"CUTOVER"
   [ "$status" -eq 0 ]
-  assert_contains "$output" "https://icecast.test:8443/dry"
+  assert_contains "$output" "Cut-over done"
+  refute_contains "$output" "teploe"
+  refute_contains "$output" "$SOURCE_PW"
+  ! grep -rq -e "$SOURCE_PW" "$ROOT/logs" "$ROOT/state.json"
+  run events
+  assert_contains "$output" "UP liquidsoap"
+}
+
+@test "the listen hint follows the current settings" {
+  cutover_ready
+  stream_api icecast.test 8443 /dry true
+  run radioctl cutover <<<"CUTOVER"
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "The source streams to https://icecast.test:8443/dry."
+  assert_contains "$output" "https://icecast.test:8443/status-json.xsl (listenurl of /dry)"
+  refute_contains "$output" "teploe"
+}
+
+@test "cutover refuses an empty or invalid server" {
+  cutover_ready
+  stream_api "" 8001 /atlantida true
+  run radioctl cutover <<<"CUTOVER"
+  [ "$status" -eq 1 ]
+  assert_contains "$output" "not ready: stream.icecast_host is not set"
+  stream_api "bad host" 0 atlantida true
+  run radioctl cutover <<<"CUTOVER"
+  [ "$status" -eq 1 ]
+  assert_contains "$output" "not ready: stream.icecast_host 'bad host' is not a host name or IP address"
+  assert_contains "$output" "not ready: stream.icecast_port '0' is not a port"
+  assert_contains "$output" "not ready: stream.mount 'atlantida' is not a mount"
+  stream_api icecast 8000 /radio false
+  run radioctl cutover <<<"CUTOVER"
+  [ "$status" -eq 1 ]
+  assert_contains "$output" "stream.icecast_host is 'icecast', the code default"
+  api api_settings '{"items":[{"key":"playout.emergency_playlist_id","value":7}]}'
+  run radioctl cutover <<<"CUTOVER"
+  [ "$status" -eq 1 ]
+  assert_contains "$output" "not ready: stream.icecast_port is not set"
+  assert_contains "$output" "not ready: stream.mount is not set"
+  run events
+  refute_contains "$output" "liquidsoap"
+  [ -z "$(st '.cutover_utc // empty')" ]
+}
+
+@test "cutover refuses a missing source password" {
+  cutover_ready
+  sed -i 's|^ICECAST_SOURCE_PASSWORD=.*|ICECAST_SOURCE_PASSWORD=change-me|' "$ROOT/.env"
+  run radioctl cutover <<<"CUTOVER"
+  [ "$status" -eq 1 ]
+  assert_contains "$output" "not ready: the Icecast source password is not set: ICECAST_SOURCE_PASSWORD in .env"
+  sed -i 's|^ICECAST_SOURCE_PASSWORD=.*|ICECAST_SOURCE_PASSWORD=|' "$ROOT/.env"
+  run radioctl cutover <<<"CUTOVER"
+  [ "$status" -eq 1 ]
+  assert_contains "$output" ".env lacks: ICECAST_SOURCE_PASSWORD"
+  sed -i "s|^ICECAST_SOURCE_PASSWORD=.*|ICECAST_SOURCE_PASSWORD=$SOURCE_PW|" "$ROOT/.env"
+  api api_settings_secrets '{"items":[{"name":"ICECAST_SOURCE_PASSWORD","group":"stream","is_set":false}]}'
+  run radioctl cutover <<<"CUTOVER"
+  [ "$status" -eq 1 ]
+  assert_contains "$output" "not ready: the backend reports ICECAST_SOURCE_PASSWORD as not set"
+  run events
+  refute_contains "$output" "liquidsoap"
+}
+
+@test "RADIOCTL_STREAM_OVERRIDE must be a JSON object" {
   RADIOCTL_STREAM_OVERRIDE='[1]' run radioctl status
   [ "$status" -eq 2 ]
   assert_contains "$output" "RADIOCTL_STREAM_OVERRIDE is not a JSON object"
@@ -176,10 +296,54 @@ first_run_setup() {
   [ "$(st .current.backend_tag)" = 1.0.1 ]
   [ "$(st .last_result)" = ok ]
   [ "$(st .applied.liquidsoap_image)" = savonet/liquidsoap:v2.4.6 ]
-  [ "$(jq -r '.values["stream.icecast_host"]' "$STUB_DIR/patch_body")" = listen.teploe.net ]
-  [ "$(jq -r '.values["stream.bitrate_kbps"]' "$STUB_DIR/patch_body")" = 160 ]
-  [ "$(jq -r '.values["stream.icecast_tls"]' "$STUB_DIR/patch_body")" = true ]
+  # The stream settings are exactly config/stream-defaults.json.
+  [ "$(jq -cS .values "$STUB_DIR/patch_body")" = "$(jq -cS . "$ROOT/config/stream-defaults.json")" ]
   ! grep -rq -e ghtoken -e icepass "$ROOT/logs"
+}
+
+@test "first run proposes config/stream-defaults.json, with the dry-run overlay" {
+  first_run_setup
+  jq '."stream.icecast_host" = "moved.example.net" | ."stream.icecast_port" = 9000' \
+    "$REPO/config/stream-defaults.json" >"$ROOT/config/stream-defaults.json"
+  run radioctl --yes first-run <<<$'ghuser\nghtoken\nicepass'
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "stream.icecast_host = moved.example.net"
+  assert_contains "$output" "Save these stream settings? yes (--yes)"
+  [ "$(jq -r '.values["stream.icecast_host"]' "$STUB_DIR/patch_body")" = moved.example.net ]
+  [ "$(jq -r '.values["stream.icecast_port"]' "$STUB_DIR/patch_body")" = 9000 ]
+  [ "$(jq -r '.values["stream.bitrate_kbps"]' "$STUB_DIR/patch_body")" = 160 ]
+
+  first_run_setup
+  rm -f "$STUB_DIR/patch_body"
+  RADIOCTL_STREAM_OVERRIDE='{"stream.icecast_host":"icecast.test","stream.icecast_port":8443}' \
+    run radioctl --yes first-run <<<$'ghuser\nghtoken\nicepass'
+  [ "$status" -eq 0 ]
+  [ "$(jq -r '.values["stream.icecast_host"]' "$STUB_DIR/patch_body")" = icecast.test ]
+  [ "$(jq -r '.values["stream.icecast_port"]' "$STUB_DIR/patch_body")" = 8443 ]
+  [ "$(jq -r '.values["stream.mount"]' "$STUB_DIR/patch_body")" = "$(jq -r '."stream.mount"' "$ROOT/config/stream-defaults.json")" ]
+}
+
+@test "first run: an edited server is sent in the PATCH" {
+  first_run_setup
+  # Secrets, then: edit; host (an invalid one first), port, mount kept, TLS off; save.
+  run radioctl first-run <<<$'ghuser\nghtoken\nicepass\ne\nbad host!\nnew.example.org\n8100\n\nfalse\ny'
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "must be a host name or an IP address"
+  assert_contains "$output" "stream.icecast_host = new.example.org"
+  [ "$(jq -r '.values["stream.icecast_host"]' "$STUB_DIR/patch_body")" = new.example.org ]
+  [ "$(jq '.values["stream.icecast_port"]' "$STUB_DIR/patch_body")" = 8100 ]
+  [ "$(jq '.values["stream.icecast_tls"]' "$STUB_DIR/patch_body")" = false ]
+  [ "$(jq -r '.values["stream.mount"]' "$STUB_DIR/patch_body")" = "$(jq -r '."stream.mount"' "$ROOT/config/stream-defaults.json")" ]
+  [ "$(jq -r '.values["stream.codec"]' "$STUB_DIR/patch_body")" = mp3 ]
+}
+
+@test "first run: n leaves the stream settings to the panel" {
+  first_run_setup
+  rm -f "$STUB_DIR/patch_body"
+  run radioctl first-run <<<$'ghuser\nghtoken\nicepass\nn'
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "not saved; set them in the panel"
+  [ ! -f "$STUB_DIR/patch_body" ]
 }
 
 @test "first run refuses an empty prompted value" {

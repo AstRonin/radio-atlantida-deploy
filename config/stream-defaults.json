@@ -1,0 +1,11 @@
+{
+  "stream.icecast_host": "listen.teploe.net",
+  "stream.icecast_port": 8001,
+  "stream.mount": "/atlantida",
+  "stream.icecast_tls": true,
+  "stream.codec": "mp3",
+  "stream.bitrate_kbps": 160,
+  "stream.sample_rate_hz": 44100,
+  "stream.channels": 2,
+  "stream.name": "Radio Atlantida"
+}

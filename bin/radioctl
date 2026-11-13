@@ -44,9 +44,9 @@
 #   RADIOCTL_BOOT_WAIT        boot check: seconds to wait (default 600)
 #   RADIOCTL_UPTIME0          boot check: VM uptime in seconds at its start
 #                             (default: /proc/uptime)
-#   RADIOCTL_STREAM_OVERRIDE  JSON object merged over the first-run stream
-#                             settings (a test Icecast; also what the cut-over
-#                             expects)
+#   RADIOCTL_STREAM_OVERRIDE  JSON object merged over config/stream-defaults.json,
+#                             the stream settings the first run proposes (a
+#                             test Icecast in the dry run)
 
 set -Eeuo pipefail
 shopt -s inherit_errexit
@@ -66,7 +66,6 @@ HEALTH_TIMEOUT=${RADIOCTL_HEALTH_TIMEOUT:-90}
 ((HEALTH_TIMEOUT >= 60)) || HEALTH_TIMEOUT=60
 LOCK_WAIT=${RADIOCTL_LOCK_WAIT:-600}
 API=http://127.0.0.1:8090
-LISTEN_HINT=https://listen.teploe.net:8001/atlantida
 
 ENV_FILE=$ROOT/.env
 RELEASE_FILE=$ROOT/release.env
@@ -79,28 +78,17 @@ NETWORK_ENV=$RUNTIME_DIR/network.env
 LOG_DIR=$ROOT/logs
 SCRIPT_FILE=$ROOT/config/liquidsoap/radio.liq
 
-# The first-run stream output (plan 6.8, 11.14); panel settings afterwards.
-FIRST_RUN_STREAM='{
-  "stream.icecast_host": "listen.teploe.net",
-  "stream.icecast_port": 8001,
-  "stream.mount": "/atlantida",
-  "stream.icecast_tls": true,
-  "stream.codec": "mp3",
-  "stream.bitrate_kbps": 160,
-  "stream.sample_rate_hz": 44100,
-  "stream.channels": 2,
-  "stream.name": "Radio Atlantida"
-}'
-# Dry-run switch: a JSON object merged over FIRST_RUN_STREAM, e.g. a test
-# Icecast in the Mac dry run (D7 9.3); the cut-over preconditions then expect
-# those values, and the listen hint follows them.
-if [[ -n ${RADIOCTL_STREAM_OVERRIDE:-} ]]; then
-  FIRST_RUN_STREAM=$(jq -e --argjson o "$RADIOCTL_STREAM_OVERRIDE" 'if ($o | type) == "object" then . + $o else error end' \
-    <<<"$FIRST_RUN_STREAM" 2>/dev/null) || {
-    echo "ERROR: RADIOCTL_STREAM_OVERRIDE is not a JSON object" >&2
-    exit 2
-  }
-  LISTEN_HINT=$(jq -r '"\(if ."stream.icecast_tls" then "https" else "http" end)://\(."stream.icecast_host"):\(."stream.icecast_port")\(."stream.mount")"' <<<"$FIRST_RUN_STREAM")
+# The stream output the first run proposes (plan 6.8, 11.14): a tracked
+# file, so a moved server needs no code change. Afterwards the panel
+# settings stream.* are the only source of truth; nothing here compares them
+# with these values.
+STREAM_DEFAULTS_FILE=$ROOT/config/stream-defaults.json
+# Dry-run switch: a JSON object merged over the defaults, e.g. a test Icecast
+# in the Mac dry run (D7 9.3).
+if [[ -n ${RADIOCTL_STREAM_OVERRIDE:-} ]] &&
+  ! jq -e 'type == "object"' <<<"$RADIOCTL_STREAM_OVERRIDE" >/dev/null 2>&1; then
+  echo "ERROR: RADIOCTL_STREAM_OVERRIDE is not a JSON object" >&2
+  exit 2
 fi
 
 DRY_RUN=false
@@ -406,6 +394,82 @@ setting() {
   local body
   body=$(api_get /api/settings) || return 1
   jq -r --arg k "$1" '.items[] | select(.key == $k) | .value | if type == "string" then . else tojson end' <<<"$body"
+}
+
+# ---------------------------------------------------------------------------
+# Stream output: the panel settings stream.* (design §8.8). The server may
+# move; radioctl never assumes one.
+
+# stream_settings: the current stream.* settings as one JSON object.
+stream_settings() {
+  local body
+  body=$(api_get /api/settings) || return 1
+  jq -ce '[.items[] | select(.key | startswith("stream.")) | {(.key): .value}] | add // {}' <<<"$body"
+}
+
+# stream_defaults: config/stream-defaults.json with RADIOCTL_STREAM_OVERRIDE
+# merged over it (the values the first run proposes).
+stream_defaults() {
+  local d
+  d=$(jq -ce 'if type == "object" then . else error("not an object") end' "$STREAM_DEFAULTS_FILE" 2>&5) || return 1
+  if [[ -n ${RADIOCTL_STREAM_OVERRIDE:-} ]]; then
+    d=$(jq -c --argjson o "$RADIOCTL_STREAM_OVERRIDE" '. + $o' <<<"$d")
+  fi
+  printf '%s' "$d"
+}
+
+# stream_base <settings json>: scheme://host:port of the Icecast server.
+stream_base() {
+  jq -r '"\(if ."stream.icecast_tls" == true then "https" else "http" end)://"
+    + (."stream.icecast_host" // "?" | tostring | if test(":") then "[\(.)]" else . end)
+    + ":\(."stream.icecast_port" // "?")"' <<<"$1"
+}
+
+# stream_source_url <settings json>: where liquidsoap sends the stream. The
+# listener URL may differ (another port, plain HTTP): the server's status
+# page lists it as the mount's listenurl.
+stream_source_url() { printf '%s%s' "$(stream_base "$1")" "$(jq -r '."stream.mount" // "?"' <<<"$1")"; }
+
+# stream_show <settings json>: the output, one line per part.
+stream_show() {
+  local l
+  while IFS= read -r l; do say "$l"; done < <(jq -r '
+    "    server    \(."stream.icecast_host" // "(not set)"), port \(."stream.icecast_port" // "(not set)"), TLS \(if ."stream.icecast_tls" == true then "on" else "off" end)",
+    "    mount     \(."stream.mount" // "(not set)")",
+    "    format    \(."stream.codec" // "?"), \(."stream.bitrate_kbps" // "?") kbps, \(."stream.sample_rate_hz" // "?") Hz, \(."stream.channels" // "?") channel(s)"' <<<"$1")
+}
+
+# listen_hint <settings json>: what to listen to after a change.
+listen_hint() {
+  say "The source streams to $(stream_source_url "$1")."
+  say "The listener URL (it may use another port or plain HTTP) is on the Icecast status page:"
+  say "    $(stream_base "$1")/status-json.xsl (listenurl of $(jq -r '."stream.mount" // "?"' <<<"$1"))"
+}
+
+# The checks of the backend (internal/settings/definitions.go).
+valid_host() {
+  local h=$1 l parts
+  [[ -n $h && ${#h} -le 253 ]] || return 1
+  if [[ $h == *:* ]]; then
+    [[ $h =~ ^[0-9A-Fa-f:.]+$ ]]
+    return
+  fi
+  [[ $h != *. ]] || return 1
+  IFS=. read -ra parts <<<"$h"
+  for l in "${parts[@]}"; do
+    [[ $l =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]] || return 1
+  done
+}
+valid_port() { [[ $1 =~ ^[0-9]{1,5}$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535)); }
+valid_mount() { [[ ${#1} -le 100 && $1 =~ ^/[A-Za-z0-9._~-]+$ ]]; }
+valid_bool() { [[ ${1,,} =~ ^(true|false|yes|no|y|n|on|off)$ ]]; }
+
+# source_password_set: ICECAST_SOURCE_PASSWORD in .env is set and not the
+# placeholder of .env.example. The value is never printed.
+source_password_set() {
+  local v
+  v=$(envv ICECAST_SOURCE_PASSWORD)
+  [[ -n $v && $v != change-me ]]
 }
 
 container_status() {
@@ -1145,7 +1209,10 @@ typed() {
 # Liquidsoap and db: applied values and pending maintenance (plan 7.3 step 13)
 
 # infra_now: the JSON of the liquidsoap and db values this repository
-# would apply now.
+# would apply now. liquidsoap_env_sha256 is a hash of liquidsoap's rendered
+# environment, which holds .env values Liquidsoap reads only when it starts
+# (ICECAST_SOURCE_PASSWORD, LIQUIDSOAP_CONTROL_*): a changed password is a
+# pending change. Only the hash is kept; no value is printed or logged.
 infra_now() {
   local cfg contract
   cfg=$(dc config --format json 2>&5) || return 1
@@ -1154,10 +1221,22 @@ infra_now() {
     --arg script "$(sha256 <"$SCRIPT_FILE")" \
     --argjson contract "$contract" \
     --arg ldef "$(jq -cS '.services.liquidsoap' <<<"$cfg" | sha256)" \
+    --arg lenv "$(jq -cS '.services.liquidsoap.environment // {}' <<<"$cfg" | sha256)" \
     --arg ddef "$(jq -cS '.services.db' <<<"$cfg" | sha256)" \
     '{liquidsoap_image: $cfg.services.liquidsoap.image, liquidsoap_script_sha256: $script,
       liquidsoap_contract: $contract, liquidsoap_definition_sha256: $ldef,
+      liquidsoap_env_sha256: $lenv,
       db_image: $cfg.services.db.image, db_definition_sha256: $ddef}'
+}
+
+# backfill_env_hash <infra_now json>: a state.json from before
+# liquidsoap_env_sha256 gets it when the definition (which contains the
+# environment) is unchanged, so the environment is the applied one.
+backfill_env_hash() {
+  [[ -z $(state_get '.applied.liquidsoap_env_sha256 // empty') ]] || return 0
+  [[ -n $(state_get '.applied.liquidsoap_image // empty') ]] || return 0
+  state_set 'if .applied.liquidsoap_definition_sha256 == $n.liquidsoap_definition_sha256
+    then .applied.liquidsoap_env_sha256 = $n.liquidsoap_env_sha256 else . end' --argjson n "$1"
 }
 
 # pending_list <infra_now json>: one line per difference to state.applied.
@@ -1167,7 +1246,8 @@ pending_list() {
     (if ($a.liquidsoap_image // null) != $now.liquidsoap_image then "liquidsoap image \($a.liquidsoap_image // "unknown") -> \($now.liquidsoap_image)" else empty end),
     (if ($a.liquidsoap_contract // null) != $now.liquidsoap_contract then "liquidsoap script contract \($a.liquidsoap_contract // "unknown") -> \($now.liquidsoap_contract)"
      elif ($a.liquidsoap_script_sha256 // null) != $now.liquidsoap_script_sha256 then "liquidsoap script config/liquidsoap/radio.liq changed" else empty end),
-    (if ($a.liquidsoap_definition_sha256 // null) != $now.liquidsoap_definition_sha256 and ($a.liquidsoap_image // null) == $now.liquidsoap_image then "liquidsoap service definition changed" else empty end),
+    (if ($a.liquidsoap_env_sha256 // null) != null and $a.liquidsoap_env_sha256 != $now.liquidsoap_env_sha256 then "liquidsoap environment changed (.env values it reads at start, e.g. ICECAST_SOURCE_PASSWORD)"
+     elif ($a.liquidsoap_definition_sha256 // null) != $now.liquidsoap_definition_sha256 and ($a.liquidsoap_image // null) == $now.liquidsoap_image then "liquidsoap service definition changed" else empty end),
     (if ($a.db_image // null) != $now.db_image then "db image \($a.db_image // "unknown") -> \($now.db_image)" else empty end),
     (if ($a.db_definition_sha256 // null) != $now.db_definition_sha256 and ($a.db_image // null) == $now.db_image then "db service definition changed" else empty end)
   ' "$STATE_FILE"
@@ -1185,6 +1265,7 @@ report_pending() {
     state_set '.applied += $n' --argjson n "$infra"
     return 0
   fi
+  backfill_env_hash "$infra"
   list=$(pending_list "$infra")
   if [[ -z $list ]]; then
     say "    none"
@@ -1580,10 +1661,11 @@ Commands:
   restore [<dump>]  restore the database from the last update dump or <dump>
                     (typed RESTORE)
   maintenance       apply pending liquidsoap/db changes (typed MAINTENANCE)
-  cutover [--undo]  start liquidsoap on the external mount, or stop it again
-                    (typed CUTOVER)
+  cutover [--undo]  start liquidsoap on the mount of the panel's stream
+                    settings (shown, typed CUTOVER), or stop it again
   first-run [--media-root <path>]
-                    first configuration of a new machine (called by install.bat)
+                    first configuration of a new machine (called by install.bat);
+                    proposes config/stream-defaults.json as the stream settings
   status            release, containers, air, pending maintenance, backups, disk
   logs [<service>]  the last run log, or the container logs of a service
   compose <args>    docker compose with the production files (diagnostics only)
@@ -1697,6 +1779,7 @@ cmd_maintenance() {
   step "Pending maintenance"
   local infra list body l db_aff=false ls_aff=false
   infra=$(infra_now) || die "cannot render the compose file; see $LOG_REL"
+  backfill_env_hash "$infra"
   list=$(pending_list "$infra")
   if [[ -z $list ]]; then
     say "Nothing is pending."
@@ -1786,7 +1869,7 @@ cmd_cutover() {
     return 0
   }
   step "Cut-over preconditions"
-  local bad=() body hs he n v k want
+  local bad=() body hs he n v stream
   api_get /readyz >/dev/null || bad+=("the backend is not ready")
   hs=$(fmt_time UTC '%Y-%m-%dT%H:00:00Z' "$(now)")
   he=$(fmt_time UTC '%Y-%m-%dT%H:00:00Z' "$(($(now) + 86400))")
@@ -1798,18 +1881,51 @@ cmd_cutover() {
   fi
   v=$(setting playout.emergency_playlist_id) || v=
   [[ -n $v && $v != null ]] || bad+=("no emergency playlist is set (playout.emergency_playlist_id)")
-  for k in stream.icecast_host stream.icecast_port stream.mount stream.icecast_tls; do
-    want=$(jq -r --arg k "$k" '.[$k] | if type == "string" then . else tojson end' <<<"$FIRST_RUN_STREAM")
-    v=$(setting "$k") || v=
-    [[ $v == "$want" ]] || bad+=("$k is '$v', expected '$want'")
-  done
+  # The stream output is whatever the panel says (the server may have
+  # moved): only checked for being set and valid, then shown for the
+  # operator to confirm.
+  if stream=$(stream_settings); then
+    v=$(jq -r '."stream.icecast_host" // "" | tostring' <<<"$stream")
+    if [[ -z $v ]]; then
+      bad+=("stream.icecast_host is not set")
+    elif ! valid_host "$v"; then
+      bad+=("stream.icecast_host '$v' is not a host name or IP address")
+    elif [[ $v == icecast ]]; then
+      bad+=("stream.icecast_host is 'icecast', the code default (the dev stack's server): set the server in the panel")
+    fi
+    v=$(jq -r '."stream.icecast_port" // "" | tostring' <<<"$stream")
+    if [[ -z $v ]]; then
+      bad+=("stream.icecast_port is not set")
+    elif ! valid_port "$v"; then
+      bad+=("stream.icecast_port '$v' is not a port (1-65535)")
+    fi
+    v=$(jq -r '."stream.mount" // "" | tostring' <<<"$stream")
+    if [[ -z $v ]]; then
+      bad+=("stream.mount is not set")
+    elif ! valid_mount "$v"; then
+      bad+=("stream.mount '$v' is not a mount (/ followed by letters, digits, or . _ ~ -)")
+    fi
+  else
+    stream=
+    bad+=("the stream settings could not be read")
+  fi
+  source_password_set || bad+=("the Icecast source password is not set: ICECAST_SOURCE_PASSWORD in .env (runbook 10.6)")
+  if body=$(api_get /api/settings/secrets) &&
+    [[ $(jq -r '.items[]? | select(.name == "ICECAST_SOURCE_PASSWORD") | .is_set' <<<"$body" 2>/dev/null) == false ]]; then
+    bad+=("the backend reports ICECAST_SOURCE_PASSWORD as not set")
+  fi
   if ((${#bad[@]})); then
     for v in "${bad[@]}"; do say "    not ready: $v"; done
     refuse "The cut-over is not started."
   fi
   say "    all preconditions met"
+  say "The stream output (panel \"Stream output (Icecast)\"), used as it is:"
+  stream_show "$stream"
+  say "    source    $(stream_source_url "$stream")"
+  say "    source password (ICECAST_SOURCE_PASSWORD): set"
+  say "Check these values; change them in the panel first if they are wrong."
   say "Stop the old source on the old system first."
-  typed CUTOVER "Start liquidsoap on $LISTEN_HINT now?" || refuse "Not confirmed."
+  typed CUTOVER "Start liquidsoap and stream to $(stream_source_url "$stream") with these settings now?" || refuse "Not confirmed."
   local infra
   infra=$(infra_now) || infra='{}'
   mut dc up -d --no-deps liquidsoap || die "liquidsoap did not start; see $LOG_REL"
@@ -1820,7 +1936,11 @@ cmd_cutover() {
     exit 1
   fi
   state_set '.cutover_utc = $u | .applied += $n' --arg u "$(utc_now)" --argjson n "$infra"
-  say "Cut-over done. Listen to $LISTEN_HINT and check by ear. Log: $LOG_REL"
+  say "Cut-over done."
+  # The settings as they are now (they may have been changed meanwhile).
+  body=$(stream_settings) && stream=$body
+  listen_hint "$stream"
+  say "Listen and check by ear. Log: $LOG_REL"
 }
 
 wait_cutover() {
@@ -1896,6 +2016,88 @@ prompt_secret() {
     break
   done
   NEWENV[$1]=$v
+}
+
+# ask_valid <label> <current> <check function> <what is valid>: a value,
+# the current one on an empty answer (or at the end of the input).
+ask_valid() {
+  local v
+  while :; do
+    printf '    %s [%s]: ' "$1" "$2" >&3
+    IFS= read -r v || {
+      printf '%s' "$2"
+      return 0
+    }
+    v=${v//[[:space:]]/}
+    [[ -n $v ]] || v=$2
+    if "$3" "$v"; then
+      log "stream setting $1 = $v"
+      printf '%s' "$v"
+      return 0
+    fi
+    printf '    must be %s\n' "$4" >&3
+  done
+}
+
+# stream_edit <settings json>: asks for host, port, mount, and TLS; prints
+# the settings with the answers.
+stream_edit() {
+  local s=$1 h p m t
+  h=$(ask_valid "Icecast host" "$(jq -r '."stream.icecast_host" // ""' <<<"$s")" valid_host "a host name or an IP address")
+  p=$(ask_valid "Icecast port" "$(jq -r '."stream.icecast_port" // ""' <<<"$s")" valid_port "a number from 1 to 65535")
+  m=$(ask_valid "Mount" "$(jq -r '."stream.mount" // ""' <<<"$s")" valid_mount "/ followed by letters, digits, or . _ ~ -")
+  t=$(ask_valid "TLS (true/false)" "$(jq -r '."stream.icecast_tls" // false' <<<"$s")" valid_bool "true or false")
+  case ${t,,} in
+    true | yes | y | on) t=true ;;
+    *) t=false ;;
+  esac
+  # Only at the end of the input with an invalid proposal: keep it as it was.
+  if ! valid_host "$h" || ! valid_port "$p" || ! valid_mount "$m"; then
+    printf '%s' "$s"
+    return 0
+  fi
+  jq -c --arg h "$h" --argjson p "$((10#$p))" --arg m "$m" --argjson t "$t" \
+    '. + {"stream.icecast_host": $h, "stream.icecast_port": $p, "stream.mount": $m, "stream.icecast_tls": $t}' <<<"$s"
+}
+
+# first_run_stream: proposes config/stream-defaults.json (with the dry-run
+# overlay) as the stream settings. The operator saves them, edits the
+# server first, or leaves them for the panel; --yes saves the defaults.
+first_run_stream() {
+  local s ans
+  if ! s=$(stream_defaults); then
+    warn "config/stream-defaults.json is missing or not a JSON object; set the stream in the panel under \"Stream output (Icecast)\" before the cut-over"
+    return 0
+  fi
+  while :; do
+    say "Proposed stream output (config/stream-defaults.json; panel settings, changeable at any time):"
+    jq -r 'to_entries[] | "    \(.key) = \(.value)"' <<<"$s" >&3
+    if $YES; then
+      say "Save these stream settings? yes (--yes)"
+      ans=y
+    elif $DRY_RUN; then
+      say "    [dry-run] would ask: Save these stream settings?"
+      ans=y
+    else
+      printf 'Save these stream settings? [y = save, e = edit server/port/mount/TLS, n = not now] ' >&3
+      IFS= read -r ans || ans=n
+      log "save stream settings -> $ans"
+    fi
+    case ${ans,,} in
+      y | yes) break ;;
+      e | edit) s=$(stream_edit "$s") ;;
+      *)
+        say "    not saved; set them in the panel under \"Stream output (Icecast)\" before the cut-over"
+        return 0
+        ;;
+    esac
+  done
+  if $DRY_RUN; then
+    say "    [dry-run] PATCH /api/settings"
+  else
+    api_patch_settings "$s" || first_run_fail "stream settings (PATCH /api/settings)"
+    say "    saved"
+  fi
 }
 
 first_run_fail() {
@@ -1999,18 +2201,7 @@ cmd_first_run() {
   apply_monitoring
 
   step "Stream settings"
-  say "Proposed stream output (panel settings, changeable at any time):"
-  jq -r 'to_entries[] | "    \(.key) = \(.value)"' <<<"$FIRST_RUN_STREAM" >&3
-  if confirm "Save these stream settings?"; then
-    if $DRY_RUN; then
-      say "    [dry-run] PATCH /api/settings"
-    else
-      api_patch_settings "$FIRST_RUN_STREAM" || first_run_fail "stream settings (PATCH /api/settings)"
-      say "    saved"
-    fi
-  else
-    say "    not saved; set them in the panel under \"Stream output (Icecast)\" before the cut-over"
-  fi
+  first_run_stream
 
   step "Backups"
   enable_backup_timer

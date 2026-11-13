@@ -19,7 +19,7 @@ Time: about two hours the first time, most of it waiting for images.
 | Docker Engine and Compose at the pinned versions (arm64 packages of the same versions) | the amd64 packages and images on the real CPU |
 | `radio-network.service` writing the VM address, the backend recreate when it changes | WSL's localhost forwarding of the `docker-proxy` sockets; the UDP path from the Windows browser to the WSL VM; mirrored networking on Windows 11 |
 | `radioctl first-run`, update, older release, refused downgrade, rollback, restore, maintenance, backup, restore drill, cut-over and undo | the keep-alive task starting WSL without a sign-in, WSL's idle shutdown |
-| the cut-over against a test Icecast behind TLS, the backend's mount check over HTTPS | the production server `listen.teploe.net:8001` (no source connection is made to it before the real cut-over) |
+| the cut-over against a test Icecast behind TLS, the backend's mount check over HTTPS | the production Icecast server, whichever the panel names at the station (today `listen.teploe.net:8001`, the default in `config/stream-defaults.json`; no source connection is made to it before the real cut-over) |
 | the boot units after `reboot` (boot check, network) | the cold-reboot test within 5 minutes of power-on, Fast Startup, BIOS power-on |
 | a media folder with group `radio-media` and group write on the VM's ext4 | the Windows media folder through the drive mount (9P): permissions, speed, Cyrillic names, Defender, indexing |
 | the backup copy to a second folder | the Windows copy on `/mnt/c` |
@@ -176,7 +176,10 @@ under test. `release.env` is now a local change: use `--no-fetch` on every
 ## 5. The dry-run environment
 
 The switches of `bin/radioctl` (environment only, never `.env`), in one file
-that both your shell and the systemd units read:
+that both your shell and the systemd units read. `RADIOCTL_STREAM_OVERRIDE`
+is merged over `config/stream-defaults.json`, the stream settings the first
+run proposes; the cut-over then uses whatever the panel says, as at the
+station:
 
 ```sh
 cat > ~/dryrun.env <<'EOF'
@@ -223,10 +226,10 @@ changing command writes `logs/<command>-<UTC>.log`.
 
 | # | Command | Expect |
 |---|---------|--------|
-| 1 | `bin/radioctl first-run --media-root /srv/radio/media` | prompts for the GHCR user and token (option B: any non-empty value), the Icecast source password (any; the test Icecast takes it from `.env`); edit `.env` afterwards to `BACKUP_WINDOWS_COPY=/srv/radio/wincopy`; stream settings proposed with `icecast.test`, `8443`: answer yes; everything starts except `liquidsoap`; the Grafana password shown once; the first backup |
+| 1 | `bin/radioctl first-run --media-root /srv/radio/media` | prompts for the GHCR user and token (option B: any non-empty value), the Icecast source password (any; the test Icecast takes it from `.env`); edit `.env` afterwards to `BACKUP_WINDOWS_COPY=/srv/radio/wincopy`; stream settings proposed with `icecast.test`, `8443` (the rest from `config/stream-defaults.json`): answer `e` once and keep every value with Enter to see the edit prompt, then `y`; everything starts except `liquidsoap`; the Grafana password shown once; the first backup |
 | 2 | `bin/radioctl status` | the release, every service healthy except `liquidsoap`, live voice on the VM address, one daily backup |
 | 3 | panel through the SSH tunnel | import `/media` (Cyrillic and Armenian names), build a grid and clocks covering 24 hours, set the emergency playlist |
-| 4 | `bin/radioctl compose up -d icecast-test icecast-tls`, then `bin/radioctl cutover` (type `CUTOVER`) | preconditions met; `Cut-over done`; listen on the Mac to `http://<VM address>:8100/atlantida`; `status`: output `connected`, broadcast `connected` (the mount check over HTTPS) |
+| 4 | `bin/radioctl compose up -d icecast-test icecast-tls`, then `bin/radioctl cutover` (type `CUTOVER`) | preconditions met; the output shown is `icecast.test`, port 8443, TLS on, the mount and format of the panel, source password `set`; `Cut-over done` with the status page `https://icecast.test:8443/status-json.xsl`; listen on the Mac to `http://<VM address>:8100/atlantida`; `status`: output `connected`, broadcast `connected` (the mount check over HTTPS) |
 | 5 | live voice from the Mac browser (panel through the tunnel) | the session connects to `<VM address>:8189/udp` |
 | 6 | the hour-boundary and fallback acceptance test of design §8.10 (plan 5.3 task 5) | as described there |
 | 7 | edit `release.env` to 1.0.1 (option B: its digests), `bin/radioctl --no-fetch update` | air check passes; dump in `/srv/radio/backups/update/`; migrations; the backend restarts while the stream continues (listen); `Done` |
@@ -240,6 +243,7 @@ changing command writes `logs/<command>-<UTC>.log`.
 | 15 | `sudo reboot`; after the boot `bin/radioctl status` | `logs/boot-*.log` ends `ok: stack healthy at VM uptime N s`; `logs/network-*.log` shows the address (and the backend recreate if it changed); Liquidsoap connected again; `systemctl list-timers 'radio-*'` |
 | 16 | `bin/radioctl cutover --undo` (type `CUTOVER`) | `liquidsoap` stopped; `status`: cut-over not yet |
 | 17 | `bin/radioctl --dry-run update` | every step printed, nothing changed |
+| 18 | `bin/radioctl cutover` again (type `CUTOVER`), then the password change of runbook 10.7: Set a new `ICECAST_SOURCE_PASSWORD` in `.env`, `bin/radioctl compose up -d icecast-test` (the test Icecast reads the same `.env`), then `bin/radioctl maintenance` (type `MAINTENANCE`) | `liquidsoap environment changed (... ICECAST_SOURCE_PASSWORD)` listed, never the value; the panel shows `reconnecting` or an outage for the gap; Liquidsoap connected again within 60 s; `status`: broadcast `connected` |
 
 **Before a release with migrations** (plan 9.3 item 2): restore a recent
 production dump in the VM (`bin/radioctl restore <path>`, the file copied

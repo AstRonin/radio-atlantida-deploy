@@ -38,6 +38,9 @@ set_clock() { printf '%s' "$1" >"$STUB_DIR/clock"; }
 # prepush window.
 CLOCK_OK=1700000000
 
+# The Icecast source password in the test .env; never in any output or log.
+SOURCE_PW=src-Pw-7f3e9a
+
 radioctl() { "$ROOT/bin/radioctl" "$@"; }
 
 queued() {
@@ -100,6 +103,7 @@ EOF
     -e "s|^PLAYOUT_JOURNAL_ROOT=.*|PLAYOUT_JOURNAL_ROOT=$ROOT/journal|" \
     -e "s|^BACKUP_ROOT=.*|BACKUP_ROOT=$ROOT/backups|" \
     -e "s|^BACKUP_WINDOWS_COPY=.*|BACKUP_WINDOWS_COPY=|" \
+    -e "s|^ICECAST_SOURCE_PASSWORD=.*|ICECAST_SOURCE_PASSWORD=$SOURCE_PW|" \
     "$REPO/.env.example" >"$ROOT/.env"
   : >"$ROOT/install/versions.env"
   printf 'LIVE_UDP_BIND=127.0.0.1\nLIVE_PUBLIC_IPS=127.0.0.1\n' >"$ROOT/runtime/network.env"
@@ -119,8 +123,10 @@ EOF
   api api_status_live '{"on_air":false,"time":"2023-11-14T22:13:20Z"}'
   api api_settings '{"items":[{"key":"playout.prepush_minutes","value":5},{"key":"station.timezone","value":"UTC"},
     {"key":"playout.emergency_playlist_id","value":7},
-    {"key":"stream.icecast_host","value":"listen.teploe.net"},{"key":"stream.icecast_port","value":8001},
-    {"key":"stream.mount","value":"/atlantida"},{"key":"stream.icecast_tls","value":true}]}'
+    {"key":"stream.icecast_host","value":"icecast.example.org"},{"key":"stream.icecast_port","value":8001},
+    {"key":"stream.mount","value":"/atlantida"},{"key":"stream.icecast_tls","value":true},
+    {"key":"stream.codec","value":"mp3"},{"key":"stream.bitrate_kbps","value":160},
+    {"key":"stream.sample_rate_hz","value":44100},{"key":"stream.channels","value":2}]}'
   stub_out compose_config '{"services":{"liquidsoap":{"image":"savonet/liquidsoap:v2.4.6","command":["/etc/liquidsoap/radio.liq"]},"db":{"image":"postgres:17.11"},"backend":{},"frontend":{}}}'
   stub_rc volume_inspect 1
   set_clock "$CLOCK_OK"
