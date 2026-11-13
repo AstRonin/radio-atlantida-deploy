@@ -7,7 +7,7 @@
 # step logic on any PowerShell: tests/install/run.sh runs them with
 # PowerShell 7 on Linux; CI on a Windows runner (D7) runs them under Windows
 # PowerShell 5.1. What the wrappers themselves do on Windows is part of the
-# Windows acceptance run (README, "D4 acceptance on Windows").
+# Windows acceptance run (docs/runbook.md section 11).
 
 BeforeAll {
     $script:RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path

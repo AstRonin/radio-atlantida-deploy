@@ -20,8 +20,8 @@
     Task Scheduler, Defender, wsl.exe, dism.exe, powercfg.exe, w32tm.exe)
     goes through thin wrappers, so tests/install/install.Tests.ps1 can mock
     them. Statements about Windows behaviour that could not be tested on a
-    Mac are marked "(verify on Windows)"; README.md collects them in the D4
-    acceptance checklist.
+    Mac are marked "(verify on Windows)"; docs/runbook.md section 11 collects
+    them in the Windows acceptance checklist.
 
 .PARAMETER DryRun
     Print every step and its check result; change nothing.
@@ -1449,7 +1449,7 @@ function Write-Summary {
     if ($script:Ctx['MediaWindows']) { Write-Info ('    media folder {0}' -f $script:Ctx.MediaWindows) }
     Write-Info '    The Grafana admin password was shown once by the first run above (it is not shown again).'
     Write-Info '    Next: import the media in the panel ("Radio panel"), build the grid and clocks, set the'
-    Write-Info '    emergency playlist, then the cut-over (update.bat cutover; README). Test a cold reboot:'
+    Write-Info '    emergency playlist, then the cut-over (update.bat cutover; docs\runbook.md). Test a cold reboot:'
     Write-Info '    the stack must be healthy within 5 minutes with nobody signed in (update.bat status).'
     Write-Info ('    Log: {0}' -f $script:Ctx.LogFile)
 }

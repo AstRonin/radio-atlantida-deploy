@@ -12,7 +12,7 @@
 # are only enabled, the journal owner is given with --journal-owner, and
 # the final checks run with --final --skip-packages (no Docker checks). The
 # real two-pass run under systemd is part of the Windows acceptance run
-# (README, D4 checklist) and of the Mac dry run VM (D7).
+# (docs/runbook.md section 11) and of the Mac dry run VM (docs/dry-run.md).
 set -Eeuo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 # ubuntu:24.04 as of 2026-11-11, pinned by digest (the release of the WSL
