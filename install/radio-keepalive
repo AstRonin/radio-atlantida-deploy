@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# /usr/local/bin/radio-keepalive (deploy-init-plan.md D4 6.4). The Windows
+# scheduled task "Radio Atlantida WSL" runs it at boot, and every 5 minutes
+# if it ever ended:
+#
+#   wsl.exe -d radio-atlantida -u radio --exec /usr/local/bin/radio-keepalive
+#
+# It writes one line and then becomes `sleep infinity`, so the wsl.exe
+# process of the task never ends and WSL does not stop the distribution for
+# being idle (systemd services such as docker.service do not count as a
+# running wsl.exe process; verify on Windows).
+#
+# The line goes to logs/keepalive.log of the deploy repository (not to the
+# boot-*.log of radio-boot-check, whose last line `update.bat status` shows),
+# or to stderr before the repository exists. The file is kept below 1 MiB.
+#
+# Test switches: RADIO_KEEPALIVE_LOG (log file), RADIO_KEEPALIVE_SLEEP
+# (argument of sleep, default infinity).
+set -Eeuo pipefail
+
+log=${RADIO_KEEPALIVE_LOG:-/opt/radio-atlantida/deploy/logs/keepalive.log}
+uptime=$(cut -d' ' -f1 /proc/uptime 2>/dev/null || echo '?')
+line="$(date -u +%Y-%m-%dT%H:%M:%SZ) keep-alive started (pid $$, VM uptime ${uptime%.*} s)"
+
+if [[ -d ${log%/*} && -w ${log%/*} ]]; then
+  if [[ -f $log ]] && (($(stat -c %s "$log") > 1048576)); then
+    tail -n 1000 "$log" >"$log.tmp" && mv "$log.tmp" "$log"
+  fi
+  printf '%s\n' "$line" >>"$log"
+else
+  printf '%s\n' "$line" >&2
+fi
+
+exec sleep "${RADIO_KEEPALIVE_SLEEP:-infinity}"
