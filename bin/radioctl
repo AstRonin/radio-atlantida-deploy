@@ -236,23 +236,33 @@ check_env_vars() {
   ((${#missing[@]} == 0)) || die ".env lacks: ${missing[*]}"
 }
 
+# app_env_body <btag> <bdigest> <ftag> <fdigest>: the KEY=VALUE lines of an
+# app env file: the release, and the values derived from .env (GRAFANA_URL).
+app_env_body() {
+  local grafana_url=
+  if monitoring_enabled; then
+    grafana_url=http://127.0.0.1:$(envv GRAFANA_PORT 3000)
+  fi
+  cat <<EOF
+BACKEND_TAG=$1
+BACKEND_DIGEST=$2
+FRONTEND_TAG=$3
+FRONTEND_DIGEST=$4
+GRAFANA_URL=$grafana_url
+EOF
+}
+
 # write_app_env <file> <btag> <bdigest> <ftag> <fdigest>
 write_app_env() {
-  local grafana_url=
-  monitoring_enabled && grafana_url=http://127.0.0.1:$(envv GRAFANA_PORT 3000)
   if $DRY_RUN; then
     say "    [dry-run] write ${1#"$ROOT"/}: backend $2, frontend $4"
     return 0
   fi
   mkdir -p "$RUNTIME_DIR"
-  cat >"$1.tmp" <<EOF
-# Written by bin/radioctl $(utc_now); the release compose runs with.
-BACKEND_TAG=$2
-BACKEND_DIGEST=$3
-FRONTEND_TAG=$4
-FRONTEND_DIGEST=$5
-GRAFANA_URL=$grafana_url
-EOF
+  {
+    printf '# Written by bin/radioctl %s; the release compose runs with.\n' "$(utc_now)"
+    app_env_body "$2" "$3" "$4" "$5"
+  } >"$1.tmp"
   mv "$1.tmp" "$1"
 }
 
@@ -1563,6 +1573,33 @@ rollback_app() {
   undone failed false "was rolled back to $CURRENT_LABEL, which did not pass its health check either; the developer must check it"
 }
 
+# refresh_app_env: the running release stays, but a value applied.env
+# derives from .env (GRAFANA_URL from MONITORING_ENABLED and GRAFANA_PORT)
+# may have changed since it was written. Then applied.env is rewritten and
+# only the frontend is recreated (about a second; the backend and the air
+# are not touched). Nothing changed: nothing is done.
+refresh_app_env() {
+  local want have old new
+  want=$(app_env_body "$C_BTAG" "$C_BDIG" "$C_FTAG" "$C_FDIG")
+  have=$(grep -v -e '^[[:space:]]*#' -e '^[[:space:]]*$' "$APPLIED_ENV" 2>/dev/null || true)
+  [[ $want == "$have" ]] && return 0
+  step "Panel settings from .env"
+  old=$(sed -n 's/^GRAFANA_URL=//p' <<<"$have" | tail -n 1)
+  new=$(sed -n 's/^GRAFANA_URL=//p' <<<"$want")
+  if [[ $old != "$new" ]]; then
+    say "    Grafana link: ${old:-none} -> ${new:-none}"
+  else
+    say "    runtime/applied.env differs from the running release; rewriting it"
+  fi
+  write_app_env "$APPLIED_ENV" "$C_BTAG" "$C_BDIG" "$C_FTAG" "$C_FDIG"
+  say "    recreating the panel only (about a second; the backend and the air are not touched)"
+  if ! mut dc up -d --no-deps frontend || ! wait_healthy frontend 60; then
+    warn "the panel (frontend) did not become healthy after the recreate; see $LOG_REL"
+    return 0
+  fi
+  $DRY_RUN || say "    healthy"
+}
+
 DB_MIN_APP_AFTER=
 
 install_release() {
@@ -1574,6 +1611,7 @@ install_release() {
   if [[ $DIRECTION == same && $T_BDIG == "$C_BDIG" && $T_FTAG == "$C_FTAG" && $T_FDIG == "$C_FDIG" && -z $RESTORE_DUMP ]]; then
     say "Release $TARGET_LABEL is already running."
     apply_monitoring
+    refresh_app_env
     report_pending
     state_set '.applied.config_sha256 = $h' --argjson h "$CONFIG_HASHES"
     say "Done."

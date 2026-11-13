@@ -423,8 +423,12 @@ A new server, or a new source password: 10.7.
   shown once at the first run). It shows the database view and the logs.
   It is optional; the station runs without it.
 - Turn it off or on: set `MONITORING_ENABLED=false` (or `true`) in `.env`
-  (10.6 shows how to edit `.env`) and run `update.bat`. The "Grafana" link
-  in the panel follows at the next release install.
+  (10.6 shows how to edit `.env`) and run `update.bat`. It starts or stops
+  Grafana, and the "Grafana" link in the panel follows at once: when the
+  release is already installed, only the panel is restarted (about a
+  second; the air is not touched). The same holds for a new `GRAFANA_PORT`.
+  The desktop shortcut "Radio Grafana" changes only with the next
+  `install.bat`.
 - Forgotten admin password:
 
   ```bat

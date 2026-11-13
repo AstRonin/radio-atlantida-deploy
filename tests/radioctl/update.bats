@@ -250,6 +250,48 @@ setup() { common_setup; }
   run events
   refute_contains "$output" "DUMP"
   refute_contains "$output" "UP backend"
+  refute_contains "$output" "UP frontend"
+  refute_contains "$output" "Panel settings"
+  grep -q '^GRAFANA_URL=http://127.0.0.1:3000$' "$ROOT/runtime/applied.env"
+}
+
+@test "the same release, monitoring turned on: GRAFANA_URL rewritten, only the frontend recreated" {
+  write_state 1.0.1 "$D_B101" 1.0.1 "$D_F101"
+  write_applied 1.0.1 "$D_B101" 1.0.1 "$D_F101"
+  sed -i 's/^GRAFANA_URL=.*/GRAFANA_URL=/' "$ROOT/runtime/applied.env"
+  run radioctl update
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "Release 1.0.1 is already running."
+  assert_contains "$output" "Grafana link: none -> http://127.0.0.1:3000"
+  grep -q '^GRAFANA_URL=http://127.0.0.1:3000$' "$ROOT/runtime/applied.env"
+  grep -q "^BACKEND_DIGEST=$D_B101$" "$ROOT/runtime/applied.env"
+  grep -q "^FRONTEND_DIGEST=$D_F101$" "$ROOT/runtime/applied.env"
+  run events
+  [ "$(grep -c '^UP frontend 1.0.1$' <<<"$output")" -eq 1 ]
+  assert_contains "$output" "UP grafana"
+  refute_contains "$output" "UP backend"
+  refute_contains "$output" "STOP"
+  refute_contains "$output" "DUMP"
+  run calls
+  assert_contains "$output" "up -d --no-deps frontend"
+}
+
+@test "the same release, monitoring turned off: GRAFANA_URL emptied, grafana stopped, only the frontend recreated" {
+  write_state 1.0.1 "$D_B101" 1.0.1 "$D_F101"
+  write_applied 1.0.1 "$D_B101" 1.0.1 "$D_F101"
+  sed -i 's/^MONITORING_ENABLED=.*/MONITORING_ENABLED=false/' "$ROOT/.env"
+  stub_out docker_ps cid-grafana
+  run radioctl update
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "Grafana link: http://127.0.0.1:3000 -> none"
+  grep -q '^GRAFANA_URL=$' "$ROOT/runtime/applied.env"
+  run events
+  [ "$(grep -c '^UP frontend 1.0.1$' <<<"$output")" -eq 1 ]
+  refute_contains "$output" "UP grafana"
+  refute_contains "$output" "UP backend"
+  run calls
+  assert_contains "$output" "stop cid-grafana"
+  refute_contains "$output" "--profile monitoring"
 }
 
 @test "history gets one entry per install" {
