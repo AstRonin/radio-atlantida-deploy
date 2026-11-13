@@ -73,6 +73,9 @@ compose() {
       exit 0
       ;;
     run)
+      # Like the real CLI: run and exec forward stdin into the container
+      # (also with -T), so a caller that does not redirect it loses it.
+      [[ -t 0 ]] || cat >/dev/null
       while [[ ${1:-} == -* ]]; do shift; done
       local svc=$1
       shift
@@ -93,6 +96,10 @@ compose() {
       while [[ ${1:-} == -* ]]; do shift; done
       local svc=$1
       shift
+      # As run: stdin is forwarded; only PATCH and pg_restore read it.
+      if [[ ! -t 0 && " $* " != *" PATCH "* && " $* " != *" pg_restore "* ]]; then
+        cat >/dev/null
+      fi
       case $svc in
         backend) backend_exec "$@" ;;
         db) db_exec "$@" ;;

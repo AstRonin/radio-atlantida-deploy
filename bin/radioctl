@@ -125,6 +125,10 @@ die() {
 }
 
 # logrun <command...>: runs it with its output in the run log.
+#
+# `docker compose exec` and `run` forward this script's stdin into the
+# container even with -T, and so would swallow the operator's answers (piped
+# or typed ahead); every exec and run that needs no input reads /dev/null.
 logrun() {
   log "+ $*"
   "$@" >&5 2>&5
@@ -383,13 +387,13 @@ dct() {
 }
 
 db_sql() {
-  dc exec -T db psql -U "$(envv POSTGRES_USER)" -d "$(envv POSTGRES_DB)" -v ON_ERROR_STOP=1 -tAc "$1" 2>&5
+  dc exec -T db psql -U "$(envv POSTGRES_USER)" -d "$(envv POSTGRES_DB)" -v ON_ERROR_STOP=1 -tAc "$1" </dev/null 2>&5
 }
 
 # api_get <path>: the body of GET <path> on the backend, through its own
 # curl (the backend publishes no port).
 api_get() {
-  dc exec -T backend curl -fsS --max-time 5 "$API$1" 2>&5
+  dc exec -T backend curl -fsS --max-time 5 "$API$1" </dev/null 2>&5
 }
 
 # api_patch_settings <json values object>
@@ -729,7 +733,7 @@ dump_db() {
   fi
   mkdir -p "$dir"
   log "+ pg_dump -Fc > $DUMP"
-  if ! dc exec -T db pg_dump -U "$(envv POSTGRES_USER)" -d "$(envv POSTGRES_DB)" -Fc >"$DUMP.part" 2>&5 ||
+  if ! dc exec -T db pg_dump -U "$(envv POSTGRES_USER)" -d "$(envv POSTGRES_DB)" -Fc </dev/null >"$DUMP.part" 2>&5 ||
     [[ ! -s $DUMP.part ]]; then
     rm -f "$DUMP.part"
     return 1
@@ -1033,7 +1037,7 @@ DRILL_TABLES=(settings tracks artists playlists clocks grid_slots scheduled_item
 DRILL_ERROR='' DRILL_VERSION='' DRILL_COUNTS='{}'
 
 drill_sql() {
-  dc exec -T db psql -U "$(envv POSTGRES_USER)" -d "$1" -v ON_ERROR_STOP=1 -tAc "$2" 2>&5
+  dc exec -T db psql -U "$(envv POSTGRES_USER)" -d "$1" -v ON_ERROR_STOP=1 -tAc "$2" </dev/null 2>&5
 }
 
 # drill_count_sql: one "table|rows" line per DRILL_TABLES entry; -1 when the
@@ -1314,7 +1318,7 @@ apply_monitoring() {
     old=$(state_get '.applied.config_sha256.grafana // empty')
     force=()
     [[ -n $old && $old != "$h" ]] && force=(--force-recreate)
-    if mut dc run --rm --no-deps -T grafana-role; then
+    if mut dc run --rm --no-deps -T grafana-role </dev/null; then
       mut dc up -d --no-deps --wait "${force[@]}" grafana || warn "monitoring: failed (grafana); see $LOG_REL"
     else
       warn "monitoring: failed (grafana-role); see $LOG_REL"
@@ -1484,7 +1488,7 @@ migrate_step() {
     say "    [dry-run] migrate target-compat; migrate up"
     return 0
   fi
-  if ! tc=$(dct run --rm --no-deps -T migrate migrate target-compat 2>&5) || ! is_semver "${tc//[[:space:]]/}"; then
+  if ! tc=$(dct run --rm --no-deps -T migrate migrate target-compat </dev/null 2>&5) || ! is_semver "${tc//[[:space:]]/}"; then
     undone failed
   fi
   tc=${tc//[[:space:]]/}
@@ -1494,7 +1498,7 @@ migrate_step() {
     logrun dc stop backend || undone failed
     stopped=true
   fi
-  logrun dct run --rm --no-deps -T migrate || rc=$?
+  logrun dct run --rm --no-deps -T migrate </dev/null || rc=$?
   log "migrate up exit code: $rc"
   case $rc in
     0)
@@ -1554,7 +1558,7 @@ restore_for_downgrade() {
   if [[ -n $RESTORE_FROM ]] && ver_gt "$T_BTAG" "$RESTORE_FROM"; then
     say "    the dump is from $RESTORE_FROM: migrating to $T_BTAG"
     local rc=0
-    mut dct run --rm --no-deps -T migrate || rc=$?
+    mut dct run --rm --no-deps -T migrate </dev/null || rc=$?
     ((rc == 0)) || undone failed true "after the restore of $(basename "$RESTORE_DUMP") (migrate exit $rc); the developer must check it. The backend is stopped"
   fi
 }
@@ -1799,7 +1803,7 @@ cmd_restore() {
   # The schema now has the dump's version: apply the running release's
   # migrations if it is newer (a no-op otherwise).
   local rc=0
-  mut dc run --rm --no-deps -T migrate || rc=$?
+  mut dc run --rm --no-deps -T migrate </dev/null || rc=$?
   ((rc == 0)) || warn "migrate up after the restore exited $rc; see $LOG_REL"
   mut dc up -d --no-deps backend || true
   if ! health_gate; then
@@ -2230,7 +2234,7 @@ cmd_first_run() {
   step "Starting the stack (liquidsoap stays stopped until the cut-over)"
   mut dc up -d --wait db || first_run_fail "db"
   local rc=0
-  mut dc run --rm --no-deps -T migrate || rc=$?
+  mut dc run --rm --no-deps -T migrate </dev/null || rc=$?
   ((rc == 0)) || first_run_fail "migrate (exit $rc)"
   mut dc up -d --no-deps backend || first_run_fail "backend"
   health_gate ready || first_run_fail "backend health"
