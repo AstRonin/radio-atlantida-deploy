@@ -1,0 +1,61 @@
+# Compose override of the Mac dry run (docs/dry-run.md, deploy-init-plan.md
+# D7 9.3). Never used on the station. radioctl adds it with
+#
+#   export RADIOCTL_COMPOSE_OVERRIDE=$PWD/tests/dryrun/compose.override.yml
+#
+# It adds a test Icecast behind a TLS proxy on the stack's network, reachable
+# as icecast.test:8443 (TLS only, like the production server on 8001), and
+# makes liquidsoap and backend trust the test CA, so the cut-over and the
+# backend's mount check run over TLS as in production. The listener port of
+# the test Icecast is published on the VM (8100, plain HTTP like the
+# production server's listener port) to listen by ear.
+#
+# Application images: RADIOCTL_BACKEND_IMAGE and RADIOCTL_FRONTEND_IMAGE
+# (the same variables radioctl resolves digests with) select a local test
+# registry, e.g. 127.0.0.1:5000/radio-atlantida-backend; unset, the GHCR
+# images of the release are used.
+#
+# DRYRUN_CERTS is a folder with ca.pem, cert.pem (CN and SAN icecast.test),
+# and key.pem, all readable by other users (docs/dry-run.md, step 4).
+
+services:
+  migrate:
+    image: ${RADIOCTL_BACKEND_IMAGE:-ghcr.io/astronin/radio-atlantida-backend}:${BACKEND_TAG:?run through radioctl}@${BACKEND_DIGEST:?run through radioctl}
+
+  backend:
+    image: ${RADIOCTL_BACKEND_IMAGE:-ghcr.io/astronin/radio-atlantida-backend}:${BACKEND_TAG:?run through radioctl}@${BACKEND_DIGEST:?run through radioctl}
+    volumes:
+      # The mount check reads https://icecast.test:8443/status-json.xsl.
+      - ${DRYRUN_CERTS:?set DRYRUN_CERTS}/ca.pem:/etc/ssl/certs/ca-certificates.crt:ro
+
+  frontend:
+    image: ${RADIOCTL_FRONTEND_IMAGE:-ghcr.io/astronin/radio-atlantida-frontend}:${FRONTEND_TAG:?run through radioctl}@${FRONTEND_DIGEST:?run through radioctl}
+
+  liquidsoap:
+    volumes:
+      # The test CA takes the place of the system roots (the production
+      # server has a public Let's Encrypt certificate).
+      - ${DRYRUN_CERTS:?set DRYRUN_CERTS}/ca.pem:/etc/ssl/certs/ca-certificates.crt:ro
+
+  icecast-test:
+    image: libretime/icecast:2.4.4-alpine
+    restart: unless-stopped
+    environment:
+      ICECAST_SOURCE_PASSWORD: ${ICECAST_SOURCE_PASSWORD:?set in .env}
+      ICECAST_ADMIN_PASSWORD: dryrun-admin
+      ICECAST_RELAY_PASSWORD: dryrun-relay
+      ICECAST_HOSTNAME: icecast.test
+    ports:
+      - "8100:8000"
+    networks: [radio]
+
+  icecast-tls:
+    image: nginxinc/nginx-unprivileged:1.29.8-alpine
+    restart: unless-stopped
+    volumes:
+      - ./tests/dryrun/tlsproxy.conf:/etc/nginx/nginx.conf:ro
+      - ${DRYRUN_CERTS:?set DRYRUN_CERTS}:/certs:ro
+    depends_on: [icecast-test]
+    networks:
+      radio:
+        aliases: [icecast.test]
