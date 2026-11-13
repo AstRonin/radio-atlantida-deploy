@@ -117,6 +117,25 @@ setup() { common_setup; }
   [ -n "$(st '.cutover_utc // empty')" ]
 }
 
+@test "cutover with RADIOCTL_STREAM_OVERRIDE expects the test server (dry run)" {
+  write_state 1.0.0 "$D_B100" 1.0.0 "$D_F100" null false
+  api api_track-plan "$(jq -n '{items: [range(24) | {items: [{}]}]}')"
+  export RADIOCTL_STREAM_OVERRIDE='{"stream.icecast_host":"icecast.test","stream.icecast_port":8443,"stream.mount":"/dry"}'
+  run radioctl cutover <<<"CUTOVER"
+  [ "$status" -eq 1 ]
+  assert_contains "$output" "not ready: stream.icecast_host is 'listen.teploe.net', expected 'icecast.test'"
+  assert_contains "$output" "not ready: stream.mount is '/atlantida', expected '/dry'"
+  api api_settings '{"items":[{"key":"playout.emergency_playlist_id","value":7},
+    {"key":"stream.icecast_host","value":"icecast.test"},{"key":"stream.icecast_port","value":8443},
+    {"key":"stream.mount","value":"/dry"},{"key":"stream.icecast_tls","value":true}]}'
+  run radioctl cutover <<<"CUTOVER"
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "https://icecast.test:8443/dry"
+  RADIOCTL_STREAM_OVERRIDE='[1]' run radioctl status
+  [ "$status" -eq 2 ]
+  assert_contains "$output" "RADIOCTL_STREAM_OVERRIDE is not a JSON object"
+}
+
 @test "cutover --undo asks for CUTOVER and stops liquidsoap" {
   run radioctl cutover --undo <<<"CUTOVER"
   [ "$status" -eq 0 ]

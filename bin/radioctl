@@ -44,6 +44,9 @@
 #   RADIOCTL_BOOT_WAIT        boot check: seconds to wait (default 600)
 #   RADIOCTL_UPTIME0          boot check: VM uptime in seconds at its start
 #                             (default: /proc/uptime)
+#   RADIOCTL_STREAM_OVERRIDE  JSON object merged over the first-run stream
+#                             settings (a test Icecast; also what the cut-over
+#                             expects)
 
 set -Eeuo pipefail
 shopt -s inherit_errexit
@@ -88,6 +91,17 @@ FIRST_RUN_STREAM='{
   "stream.channels": 2,
   "stream.name": "Radio Atlantida"
 }'
+# Dry-run switch: a JSON object merged over FIRST_RUN_STREAM, e.g. a test
+# Icecast in the Mac dry run (D7 9.3); the cut-over preconditions then expect
+# those values, and the listen hint follows them.
+if [[ -n ${RADIOCTL_STREAM_OVERRIDE:-} ]]; then
+  FIRST_RUN_STREAM=$(jq -e --argjson o "$RADIOCTL_STREAM_OVERRIDE" 'if ($o | type) == "object" then . + $o else error end' \
+    <<<"$FIRST_RUN_STREAM" 2>/dev/null) || {
+    echo "ERROR: RADIOCTL_STREAM_OVERRIDE is not a JSON object" >&2
+    exit 2
+  }
+  LISTEN_HINT=$(jq -r '"\(if ."stream.icecast_tls" then "https" else "http" end)://\(."stream.icecast_host"):\(."stream.icecast_port")\(."stream.mount")"' <<<"$FIRST_RUN_STREAM")
+fi
 
 DRY_RUN=false
 YES=false
@@ -2421,6 +2435,10 @@ main() {
     esac
   done
   set -- "${args[@]}"
+  # update.bat <backendTag> [<frontendTag>] (plan 7.2): a bare tag is an update.
+  if (($#)) && is_semver "$1"; then
+    set -- update "$@"
+  fi
   CMD=${1:-update}
   (($#)) && shift
   case $CMD in

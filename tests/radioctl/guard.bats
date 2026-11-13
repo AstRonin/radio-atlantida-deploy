@@ -55,6 +55,13 @@ assert_nothing_changed() {
   assert_contains "$output" "UP frontend 1.0.2"
 }
 
+@test "a bare tag is an update (update.bat 1.0.2 1.0.1)" {
+  run radioctl 1.0.2 1.0.1
+  [ "$status" -eq 0 ]
+  [ "$(st .current.backend_tag)" = 1.0.2 ]
+  [ "$(st .current.frontend_tag)" = 1.0.1 ]
+}
+
 @test "separate tags of the same MAJOR.MINOR are allowed" {
   run radioctl update 1.0.2 1.0.1
   [ "$status" -eq 0 ]
