@@ -17,6 +17,8 @@
 #   radioctl compose <args>
 #   radioctl [options] backup              (daily, radio-backup.timer)
 #   radioctl [options] restore-drill [<dump>]  (monthly, radio-restore-drill.timer)
+#   radioctl [options] network [--mode nat|mirrored]  (boot, radio-network.service)
+#   radioctl boot-check                     (boot, radio-boot-check.service)
 #
 # Options: --dry-run, --yes, --no-wait, --no-fetch, -h/--help (see usage).
 #
@@ -35,6 +37,13 @@
 #   RADIOCTL_HEALTH_TIMEOUT   backend health gate in seconds (default 90, min 60)
 #   RADIOCTL_LOCK_WAIT        seconds to wait for state.lock (default 600)
 #   RADIOCTL_FAKE_CLOCK       file holding the epoch seconds; sleeps advance it
+#   RADIOCTL_HOST_ENV         host settings of setup-distro.sh (default
+#                             /etc/radio-atlantida/host.env: RADIO_NETWORK_MODE)
+#   RADIOCTL_NET_DEV          interface of the VM address in NAT mode (eth0)
+#   RADIOCTL_NET_WAIT         seconds to wait for its IPv4 address (default 30)
+#   RADIOCTL_BOOT_WAIT        boot check: seconds to wait (default 600)
+#   RADIOCTL_UPTIME0          boot check: VM uptime in seconds at its start
+#                             (default: /proc/uptime)
 
 set -Eeuo pipefail
 shopt -s inherit_errexit
@@ -1570,6 +1579,12 @@ Commands:
                     restore the newest daily dump (or <dump>) into a scratch
                     database, check it, drop it (monthly; never touches the
                     production database)
+  network [--mode nat|mirrored]
+                    write runtime/network.env (LIVE_UDP_BIND, LIVE_PUBLIC_IPS)
+                    for the WSL network mode and recreate the backend if they
+                    changed (radio-network.service runs it at boot)
+  boot-check        wait up to 10 minutes for the stack to be healthy and
+                    record the result in logs/boot-*.log (radio-boot-check)
 
 Options:
   --dry-run   print every step and change nothing
@@ -2070,6 +2085,11 @@ cmd_status() {
   if [[ -n $boot ]]; then
     say "    boot check: $(tail -n 1 "$boot")"
   fi
+  if [[ -f $NETWORK_ENV ]]; then
+    declare -A NET=()
+    read_kv "$NETWORK_ENV" NET
+    say "    network: live voice on ${NET[LIVE_PUBLIC_IPS]:-?}:8189/udp (bound to ${NET[LIVE_UDP_BIND]:-?})"
+  fi
 
   say "Air"
   if body=$(api_get /api/broadcast/status); then
@@ -2227,7 +2247,7 @@ drill_failed() {
 cmd_logs() {
   if (($# == 0)); then
     local last
-    last=$(find "$LOG_DIR" -maxdepth 1 -name '*.log' ! -name 'boot-*' 2>/dev/null | LC_ALL=C sort | tail -n 1) || true
+    last=$(find "$LOG_DIR" -maxdepth 1 -name '*.log' ! -name 'boot-*' ! -name 'network-*' ! -name 'keepalive.log' 2>/dev/null | LC_ALL=C sort | tail -n 1) || true
     [[ -n $last ]] || die "no run log yet"
     printf '%s\n' "$last"
     tail -n 100 "$last"
@@ -2241,6 +2261,142 @@ cmd_compose() {
   load_env || die ".env is missing"
   [[ -f $APPLIED_ENV ]] || die "runtime/applied.env is missing: nothing is installed"
   dc "$@"
+}
+
+# ---------------------------------------------------------------------------
+# Boot units (plan D4 6.3 step 6, 6.5)
+
+HOST_ENV=${RADIOCTL_HOST_ENV:-/etc/radio-atlantida/host.env}
+
+# vm_address: the IPv4 address of the VM's interface (NAT mode); waits up
+# to RADIOCTL_NET_WAIT seconds, because WSL may configure eth0 a moment
+# after systemd starts.
+vm_address() {
+  local dev=${RADIOCTL_NET_DEV:-eth0} wait=${RADIOCTL_NET_WAIT:-30} deadline addr
+  deadline=$(($(now) + wait))
+  while :; do
+    addr=$(ip -4 -o addr show dev "$dev" 2>&5 | awk '{ split($4, a, "/"); print a[1]; exit }') || addr=
+    if [[ $addr =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      printf '%s' "$addr"
+      return 0
+    fi
+    (($(now) >= deadline)) && return 1
+    sleep_s 2
+  done
+}
+
+# backend_network: "<LIVE_PUBLIC_IPS> <host ip of 8189/udp>" of the backend
+# container as it was created; fails when there is no backend container.
+backend_network() {
+  local cid ips bind
+  cid=$(dc ps -q backend 2>&5) || return 1
+  [[ -n $cid ]] || return 1
+  ips=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$cid" 2>&5 | sed -n 's/^LIVE_PUBLIC_IPS=//p') || return 1
+  bind=$(docker inspect --format '{{range $p, $b := .HostConfig.PortBindings}}{{if eq $p "8189/udp"}}{{range $b}}{{.HostIp}}{{end}}{{end}}{{end}}' "$cid" 2>&5) || return 1
+  printf '%s %s' "$ips" "$bind"
+}
+
+# cmd_network: plan 6.5. NAT mode (Windows 10): LIVE_UDP_BIND=0.0.0.0 and
+# LIVE_PUBLIC_IPS=<eth0 address>; mirrored mode (Windows 11 22H2+): both
+# 127.0.0.1. Writes runtime/network.env when it differs, and recreates the
+# backend only when the running container has other values.
+cmd_network() {
+  local mode=
+  while (($#)); do
+    case $1 in
+      --mode) mode=${2:?--mode needs nat or mirrored}; shift 2 ;;
+      *) die "network takes only --mode nat|mirrored" ;;
+    esac
+  done
+  if [[ -z $mode && -f $HOST_ENV ]]; then
+    declare -A HOST=()
+    read_kv "$HOST_ENV" HOST
+    mode=${HOST[RADIO_NETWORK_MODE]:-}
+  fi
+  local bind ips
+  case $mode in
+    nat)
+      bind=0.0.0.0
+      ips=$(vm_address) || die "no IPv4 address on ${RADIOCTL_NET_DEV:-eth0} after ${RADIOCTL_NET_WAIT:-30}s"
+      ;;
+    mirrored) bind=127.0.0.1 ips=127.0.0.1 ;;
+    '') die "no network mode: $HOST_ENV has no RADIO_NETWORK_MODE (setup-distro.sh writes it) and no --mode was given" ;;
+    *) die "unknown network mode '$mode' (nat or mirrored)" ;;
+  esac
+  step "Network values ($mode mode): LIVE_UDP_BIND=$bind LIVE_PUBLIC_IPS=$ips"
+  local content
+  content="# Written by radioctl network ($mode mode); the live voice port (plan 6.5).
+LIVE_UDP_BIND=$bind
+LIVE_PUBLIC_IPS=$ips"
+  if [[ -f $NETWORK_ENV ]] && [[ $(grep -v '^#' "$NETWORK_ENV") == "$(grep -v '^#' <<<"$content")" ]]; then
+    say "    runtime/network.env unchanged"
+  elif $DRY_RUN; then
+    say "    [dry-run] write runtime/network.env"
+  else
+    mkdir -p "$RUNTIME_DIR"
+    printf '%s\n' "$content" >"$NETWORK_ENV.tmp"
+    mv "$NETWORK_ENV.tmp" "$NETWORK_ENV"
+    say "    runtime/network.env written"
+  fi
+
+  if [[ ! -f $APPLIED_ENV ]] || ! load_env; then
+    say "    no release installed yet: nothing to recreate"
+    return 0
+  fi
+  local running
+  if ! running=$(backend_network); then
+    say "    no backend container: nothing to recreate"
+    return 0
+  fi
+  if [[ $running == "$ips $bind" ]]; then
+    say "    the backend runs with these values"
+    return 0
+  fi
+  say "    the backend was created with LIVE_PUBLIC_IPS=${running% *} on ${running#* }; recreating it"
+  mut dc up -d --no-deps backend || die "recreating the backend failed; see $LOG_REL"
+  say "    backend recreated"
+}
+
+# cmd_boot_check: plan 6.3 step 6 and the D4 reboot test. Waits up to
+# RADIOCTL_BOOT_WAIT (600) seconds for every service that should run to be
+# healthy (or running, for loki, which has no health check): db, backend,
+# frontend, loki, alloy, grafana when monitoring is on, liquidsoap after the
+# cut-over. Records the VM uptime at that moment against the 5-minute
+# target. Only reports: always exits 0; the last log line is the result.
+cmd_boot_check() {
+  local wait=${RADIOCTL_BOOT_WAIT:-600} target=300 u0 t0 elapsed s st bad
+  u0=${RADIOCTL_UPTIME0:-$(cut -d' ' -f1 /proc/uptime 2>/dev/null || echo 0)}
+  u0=${u0%.*}
+  t0=$(now)
+  if ! load_env || [[ ! -f $APPLIED_ENV || ! -f $NETWORK_ENV ]]; then
+    say "boot check: skipped, no release installed yet"
+    return 0
+  fi
+  local services=(db backend frontend loki alloy)
+  monitoring_enabled && services+=(grafana)
+  cutover_done && services+=(liquidsoap)
+  say "boot check: waiting up to ${wait}s for ${services[*]} (VM uptime ${u0}s)"
+  while :; do
+    bad=()
+    for s in "${services[@]}"; do
+      st=$(container_status "$s") || st=missing
+      [[ $st == healthy || $st == running ]] || bad+=("$s=$st")
+    done
+    elapsed=$(($(now) - t0))
+    if ((${#bad[@]} == 0)); then
+      if ((u0 + elapsed <= target)); then
+        say "ok: stack healthy at VM uptime $((u0 + elapsed))s (target ${target}s)"
+      else
+        say "LATE: stack healthy at VM uptime $((u0 + elapsed))s, over the ${target}s target"
+      fi
+      return 0
+    fi
+    if ((elapsed >= wait)); then
+      say "FAILED: not healthy after ${elapsed}s (VM uptime $((u0 + elapsed))s): ${bad[*]}"
+      return 0
+    fi
+    sleep_s 5
+  done
 }
 
 main() {
@@ -2271,6 +2427,17 @@ main() {
     status) cmd_status "$@" ;;
     logs) cmd_logs "$@" ;;
     compose) cmd_compose "$@" ;;
+    boot-check)
+      open_log boot
+      cmd_boot_check "$@"
+      ;;
+    network)
+      mkdir -p "$LOG_DIR"
+      open_log network
+      take_lock
+      $DRY_RUN && say "DRY RUN: nothing is changed."
+      cmd_network "$@"
+      ;;
     backup | restore-drill)
       # The log first: a timer run that cannot take the lock (an update
       # runs) leaves its reason in a run log too.

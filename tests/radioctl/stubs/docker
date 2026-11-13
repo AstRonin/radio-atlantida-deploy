@@ -13,6 +13,11 @@
 #   db_min_app_after.out       min_app_version once `migrate up` ran
 #   db_drill_counts.out        "table|rows" lines of the restore drill
 #   drill_create.rc, drill_drop.rc   CREATE / DROP DATABASE of the drill
+#   ps_q_<service>.out         `compose ps -q <service>` (default cid-<service>;
+#                              an empty file: no container)
+#   container_env.out          `inspect` .Config.Env of a container
+#                              (default LIVE_PUBLIC_IPS=127.0.0.1)
+#   container_udp_bind.out     `inspect` host ip of 8189/udp (default 127.0.0.1)
 set -uo pipefail
 S=${STUB_DIR:?}
 printf '%s\n' "$*" >>"$S/calls.log"
@@ -96,7 +101,7 @@ compose() {
       ;;
     ps)
       if [[ ${1:-} == -q ]]; then
-        echo "cid-$2"
+        if [[ -f $S/ps_q_$2.out ]]; then cat "$S/ps_q_$2.out"; else echo "cid-$2"; fi
       else
         echo '[]'
       fi
@@ -183,6 +188,10 @@ case ${1:-} in
     ;;
   image) echo "sha256:imageid linux/amd64" ;;
   inspect)
+    case $* in
+      *Config.Env*) answer container_env "LIVE_PUBLIC_IPS=127.0.0.1" ;;
+      *PortBindings*) answer container_udp_bind 127.0.0.1 ;;
+    esac
     cid=${*: -1}
     cat "$S/health_${cid#cid-}" 2>/dev/null || echo healthy
     ;;

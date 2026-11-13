@@ -496,7 +496,7 @@ unit_value() { sed -n "s/^$2=//p" "$REPO/install/systemd/$1"; }
 @test "install-units.sh installs the units, reloads, enables the timers; a second run rewrites nothing" {
   local dest=$BATS_TEST_TMPDIR/units
   mkdir -p "$dest"
-  SYSTEMD_UNIT_DIR=$dest run "$REPO/install/systemd/install-units.sh"
+  SYSTEMD_BOOTED=yes SYSTEMD_UNIT_DIR=$dest run "$REPO/install/systemd/install-units.sh"
   [ "$status" -eq 0 ]
   cmp "$REPO/install/systemd/radio-backup.timer" "$dest/radio-backup.timer"
   cmp "$REPO/install/systemd/radio-restore-drill.service" "$dest/radio-restore-drill.service"
@@ -505,7 +505,7 @@ unit_value() { sed -n "s/^$2=//p" "$REPO/install/systemd/$1"; }
   assert_contains "$output" "systemctl daemon-reload"
   assert_contains "$output" "systemctl enable --now radio-backup.timer radio-restore-drill.timer"
   : >"$STUB_DIR/calls.log"
-  SYSTEMD_UNIT_DIR=$dest run "$REPO/install/systemd/install-units.sh"
+  SYSTEMD_BOOTED=yes SYSTEMD_UNIT_DIR=$dest run "$REPO/install/systemd/install-units.sh"
   [ "$status" -eq 0 ]
   [ -z "$output" ]
   run calls

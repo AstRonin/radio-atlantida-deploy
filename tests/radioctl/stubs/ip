@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Stub of iproute2's ip for the bats tests of `radioctl network`
+# (calls in $STUB_DIR/calls.log).
+#   ip_addr.out   output of `ip -4 -o addr show dev <dev>` (default: none)
+#   ip_addr_after the number of calls before ip_addr.out is answered
+#                 (eth0 configured late; default 0)
+set -uo pipefail
+S=${STUB_DIR:?}
+printf 'ip %s\n' "$*" >>"$S/calls.log"
+n=$(cat "$S/ip_calls" 2>/dev/null || echo 0)
+n=$((n + 1))
+echo "$n" >"$S/ip_calls"
+if ((n > $(cat "$S/ip_addr_after" 2>/dev/null || echo 0))); then
+  cat "$S/ip_addr.out" 2>/dev/null
+fi
+exit 0

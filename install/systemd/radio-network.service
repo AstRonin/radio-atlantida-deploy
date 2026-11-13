@@ -1,0 +1,28 @@
+# Network values of the live voice port (deploy-init-plan.md D4 6.5): runs
+# `radioctl network` as the Linux user radio at every boot. It writes
+# runtime/network.env (LIVE_UDP_BIND, LIVE_PUBLIC_IPS) from the network
+# mode in /etc/radio-atlantida/host.env: in NAT mode (Windows 10) the VM's
+# eth0 address, which changes at every boot, in mirrored mode (Windows 11
+# 22H2+) 127.0.0.1. When the running backend container was created with
+# other values, it recreates it (`docker compose up -d --no-deps backend`);
+# playout is not touched.
+#
+# Installed by install/systemd/install-units.sh (setup-distro.sh). Before
+# the deploy repository exists the unit is skipped; install.ps1 starts it
+# once after the clone, so the first run finds runtime/network.env.
+[Unit]
+Description=Radio Atlantida network values (radioctl network)
+Wants=docker.service
+After=docker.service
+ConditionPathExists=/opt/radio-atlantida/deploy/bin/radioctl
+
+[Service]
+Type=oneshot
+User=radio
+WorkingDirectory=/opt/radio-atlantida/deploy
+Environment=RADIOCTL_LOCK_WAIT=600
+ExecStart=/opt/radio-atlantida/deploy/bin/radioctl network
+TimeoutStartSec=15min
+
+[Install]
+WantedBy=multi-user.target

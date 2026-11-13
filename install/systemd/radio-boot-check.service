@@ -1,0 +1,23 @@
+# Boot check (deploy-init-plan.md D4 6.3 step 6, 6.4): runs `radioctl
+# boot-check` as the Linux user radio at every boot, after Docker and
+# radio-network.service. It waits up to 10 minutes for the stack to be
+# healthy and writes the result, the VM uptime when it was healthy, and the
+# 5-minute target to logs/boot-YYYY-MM-DDTHHMMSSZ.log; `update.bat status`
+# shows its last line. It only reports (always exits 0).
+#
+# Type=simple: the boot (`systemctl is-system-running`) does not wait for
+# the check's 10 minutes.
+[Unit]
+Description=Radio Atlantida boot check (radioctl boot-check)
+Wants=docker.service
+After=docker.service radio-network.service
+ConditionPathExists=/opt/radio-atlantida/deploy/runtime/applied.env
+
+[Service]
+Type=simple
+User=radio
+WorkingDirectory=/opt/radio-atlantida/deploy
+ExecStart=/opt/radio-atlantida/deploy/bin/radioctl boot-check
+
+[Install]
+WantedBy=multi-user.target
