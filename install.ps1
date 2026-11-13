@@ -81,8 +81,16 @@ $script:MinWin10Ubr = 2311
 $script:Win11Build = 22000
 # Windows 11 22H2: mirrored networking (plan 6.5).
 $script:MirroredBuild = 22621
-$script:MinFreeGB = 100
+# Free space on the drive of the distribution's virtual disk: Docker images
+# (two releases during an update), the database, the journal, and the
+# backups (14 daily and 14 update dumps, 3 boundary dumps, journal copies)
+# live there; the media folder does not (it stays on Windows, 6.6).
+$script:MinFreeGB = 40
 $script:MinRamGB = 16
+# The WSL VM's memory (.wslconfig, plan 6.4): half the RAM, at least 4 GB,
+# at most 16 GB (8 GB on a 16 GB machine).
+$script:VmMemoryMinGB = 4
+$script:VmMemoryMaxGB = 16
 $script:DefaultMediaFolder = 'D:\RadioAtlantida\media'
 # BACKUP_WINDOWS_COPY of .env.example (/mnt/c/RadioAtlantida/backups).
 $script:WindowsBackupDir = 'C:\RadioAtlantida\backups'
@@ -227,14 +235,23 @@ function ConvertFrom-KeyValueText {
     return $map
 }
 
+# Get-VmMemoryGB: the WSL VM's memory for a machine with $RamGB of RAM: half
+# of it, within VmMemoryMinGB..VmMemoryMaxGB.
+function Get-VmMemoryGB {
+    param([Parameter(Mandatory)][int]$RamGB)
+    $half = [int][Math]::Floor($RamGB / 2)
+    return [Math]::Min($script:VmMemoryMaxGB, [Math]::Max($script:VmMemoryMinGB, $half))
+}
+
 # Get-WslConfigSettings: the [wsl2] keys of %UserProfile%\.wslconfig for a
-# network mode (plan 6.4, 6.5): keys to set and keys to remove.
+# network mode and machine (plan 6.4, 6.5): keys to set and keys to remove.
 function Get-WslConfigSettings {
     param([Parameter(Mandatory)][ValidateSet('nat', 'mirrored')][string]$Mode,
-        [Parameter(Mandatory)][int]$LogicalProcessors)
+        [Parameter(Mandatory)][int]$LogicalProcessors,
+        [Parameter(Mandatory)][int]$RamGB)
     $processors = [Math]::Max(2, [Math]::Floor($LogicalProcessors / 2))
     $set = [ordered]@{
-        'memory'        = '8GB'
+        'memory'        = ('{0}GB' -f (Get-VmMemoryGB -RamGB $RamGB))
         'processors'    = [string]$processors
         'swap'          = '4GB'
         # WSL 2.x: the VM is not stopped after the last distribution stops
@@ -1032,7 +1049,7 @@ function Invoke-Preflight {
         Stop-Install 'virtualization is off: enable VT-x/AMD-V (Intel Virtualization Technology / SVM) in the BIOS/UEFI settings'
     }
     Write-Info ('    {0} GB RAM, {1} logical processors, virtualization on' -f $hw.RamGB, $hw.LogicalProcessors)
-    if ($hw.RamGB -lt $script:MinRamGB) { Write-Warn "$($hw.RamGB) GB RAM is below the recommended $($script:MinRamGB) GB (the WSL VM gets 8 GB)" }
+    if ($hw.RamGB -lt $script:MinRamGB) { Write-Warn ("{0} GB RAM is below the recommended {1} GB (the WSL VM gets {2} GB)" -f $hw.RamGB, $script:MinRamGB, (Get-VmMemoryGB -RamGB $hw.RamGB)) }
 
     $account = Get-CurrentAccountName
     if ($account -ine $script:Ctx.AccountName) {
@@ -1127,7 +1144,7 @@ function Get-WslConfigPath { return (Join-Path $script:Ctx.UserProfile '.wslconf
 
 function Get-WantedWslConfig {
     $current = Read-TextFile (Get-WslConfigPath)
-    $s = Get-WslConfigSettings -Mode $script:Ctx.NetworkMode -LogicalProcessors $script:Ctx.Hardware.LogicalProcessors
+    $s = Get-WslConfigSettings -Mode $script:Ctx.NetworkMode -LogicalProcessors $script:Ctx.Hardware.LogicalProcessors -RamGB $script:Ctx.Hardware.RamGB
     return @{ Current = $current; Wanted = (Merge-WslConfig -Text $current -Set $s.Set -Remove $s.Remove) }
 }
 

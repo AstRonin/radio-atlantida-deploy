@@ -194,22 +194,31 @@ Describe 'pure logic' {
     }
 
     Context '.wslconfig' {
+        It 'VM memory is half the RAM, at least 4 GB, at most 16 GB: <RamGB> GB -> <Want> GB' -TestCases @(
+            @{ RamGB = 4; Want = 4 }, @{ RamGB = 6; Want = 4 }, @{ RamGB = 8; Want = 4 }, @{ RamGB = 12; Want = 6 },
+            @{ RamGB = 15; Want = 7 }, @{ RamGB = 16; Want = 8 }, @{ RamGB = 24; Want = 12 }, @{ RamGB = 32; Want = 16 },
+            @{ RamGB = 64; Want = 16 }
+        ) {
+            Get-VmMemoryGB -RamGB $RamGB | Should -Be $Want
+            (Get-WslConfigSettings -Mode nat -LogicalProcessors 4 -RamGB $RamGB).Set['memory'] | Should -Be ('{0}GB' -f $Want)
+        }
         It 'NAT mode: localhostForwarding, no networkingMode; processors are half the CPUs, at least 2' {
-            $s = Get-WslConfigSettings -Mode nat -LogicalProcessors 2
+            $s = Get-WslConfigSettings -Mode nat -LogicalProcessors 2 -RamGB 16
             $text = Merge-WslConfig -Text '' -Set $s.Set -Remove $s.Remove
             $text | Should -Be "[wsl2]`r`nmemory=8GB`r`nprocessors=2`r`nswap=4GB`r`nvmIdleTimeout=-1`r`nlocalhostForwarding=true`r`n"
         }
         It 'mirrored mode: networkingMode=mirrored, localhostForwarding removed' {
-            $s = Get-WslConfigSettings -Mode mirrored -LogicalProcessors 12
+            $s = Get-WslConfigSettings -Mode mirrored -LogicalProcessors 12 -RamGB 32
             $text = Merge-WslConfig -Text "[wsl2]`r`nlocalhostForwarding=true`r`nnetworkingMode=nat`r`n" -Set $s.Set -Remove $s.Remove
             $text | Should -Match 'networkingMode=mirrored'
             $text | Should -Not -Match 'localhostForwarding'
             $text | Should -Match 'processors=6'
+            $text | Should -Match 'memory=16GB'
             ([regex]::Matches($text, 'networkingMode')).Count | Should -Be 1
         }
         It 'keeps unknown keys, other sections, and comments; a second merge changes nothing' {
             $old = "# my settings`r`n[wsl2]`r`nguiSupport=false`r`nmemory=4GB`r`n`r`n[experimental]`r`nautoMemoryReclaim=gradual`r`n"
-            $s = Get-WslConfigSettings -Mode nat -LogicalProcessors 8
+            $s = Get-WslConfigSettings -Mode nat -LogicalProcessors 8 -RamGB 16
             $new = Merge-WslConfig -Text $old -Set $s.Set -Remove $s.Remove
             $new | Should -Match '# my settings'
             $new | Should -Match 'guiSupport=false'
@@ -219,7 +228,7 @@ Describe 'pure logic' {
             Merge-WslConfig -Text $new -Set $s.Set -Remove $s.Remove | Should -Be $new
         }
         It 'adds the [wsl2] section after other sections' {
-            $s = Get-WslConfigSettings -Mode nat -LogicalProcessors 4
+            $s = Get-WslConfigSettings -Mode nat -LogicalProcessors 4 -RamGB 16
             $new = Merge-WslConfig -Text "[experimental]`r`nsparseVhd=true`r`n" -Set $s.Set -Remove $s.Remove
             $new | Should -Match '^\[experimental\]\r\nsparseVhd=true\r\n\r\n\[wsl2\]\r\nmemory=8GB'
         }
@@ -528,7 +537,7 @@ Describe 'install runs' {
             @{ Why = 'virtualization off'; Set = { $script:Fake.Hardware.VirtualizationFirmwareEnabled = $false }; Msg = '*virtualization is off*' },
             @{ Why = 'Docker Desktop'; Set = { $script:Fake.DockerDesktop = $true }; Msg = '*Docker Desktop is installed*' },
             @{ Why = 'the wrong account'; Set = { $script:Fake.Account = 'manager' }; Msg = "*signed in as the local account 'radio' (now: 'manager')*install.bat -CreateAccount*" },
-            @{ Why = 'too little disk space'; Set = { $script:Fake.FreeGB = 40 }; Msg = '*at least 100 GB*' },
+            @{ Why = 'too little disk space'; Set = { $script:Fake.FreeGB = 39 }; Msg = '*39 GB free*at least 40 GB*' },
             @{ Why = 'ARM64 Windows'; Set = { $script:Fake.Os.Architecture = 'ARM64' }; Msg = '*64-bit x86*' }
         ) {
             & $Set
@@ -596,6 +605,13 @@ Describe 'install runs' {
             $cfg | Should -Match 'guiSupport=false'
             $cfg | Should -Match 'sparseVhd=true'
             $cfg | Should -Match 'memory=8GB'
+        }
+
+        It '.wslconfig gives the VM half the RAM of the machine' {
+            $script:Fake.Hardware.RamGB = 12
+            Invoke-TestInstall | Should -Be 0
+            Get-WslConfigText | Should -Match 'memory=6GB'
+            Get-RunLog | Should -BeLike '*12 GB RAM is below the recommended 16 GB (the WSL VM gets 6 GB)*'
         }
 
         It 'an existing distribution is kept: no download, no import' {
