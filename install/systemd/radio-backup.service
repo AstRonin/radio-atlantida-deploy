@@ -1,0 +1,23 @@
+# Daily backup of Radio Atlantida (deploy-init-plan.md D6 task 2): runs
+# `radioctl backup` as the Linux user radio. Started by radio-backup.timer.
+# Installed into /etc/systemd/system by install/systemd/install-units.sh,
+# which setup-distro.sh runs as root (D4).
+#
+# radioctl takes state.lock, so a backup never runs during an update; it
+# waits for a running update up to RADIOCTL_LOCK_WAIT seconds. Nothing runs
+# before the first run has written runtime/applied.env.
+[Unit]
+Description=Radio Atlantida daily backup (radioctl backup)
+Wants=docker.service
+After=docker.service
+ConditionPathExists=/opt/radio-atlantida/deploy/runtime/applied.env
+
+[Service]
+Type=oneshot
+User=radio
+WorkingDirectory=/opt/radio-atlantida/deploy
+Environment=RADIOCTL_LOCK_WAIT=3600
+ExecStart=/opt/radio-atlantida/deploy/bin/radioctl backup
+TimeoutStartSec=2h
+Nice=10
+IOSchedulingClass=idle

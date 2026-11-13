@@ -1,0 +1,15 @@
+# Daily at 04:30 station time (deploy-init-plan.md D6 task 2, 11.12): after
+# the plan's nightly full pass at 03:00. Persistent=true runs a missed backup
+# after the next boot. The station time zone is written here explicitly
+# (the backend's station.timezone default), so the schedule does not depend
+# on the distribution's local time zone.
+[Unit]
+Description=Radio Atlantida daily backup at 04:30 station time
+
+[Timer]
+OnCalendar=*-*-* 04:30:00 Asia/Yerevan
+Persistent=true
+Unit=radio-backup.service
+
+[Install]
+WantedBy=timers.target

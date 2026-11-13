@@ -1,0 +1,13 @@
+# On the 1st of every month at 05:30 station time, an hour after the daily
+# backup, so the drill restores a fresh dump. Persistent=true runs a missed
+# drill after the next boot.
+[Unit]
+Description=Radio Atlantida monthly restore drill
+
+[Timer]
+OnCalendar=*-*-01 05:30:00 Asia/Yerevan
+Persistent=true
+Unit=radio-restore-drill.service
+
+[Install]
+WantedBy=timers.target
