@@ -15,4 +15,4 @@ docker build -q --platform linux/amd64 -t "$image" "$root/tests/install" >/dev/n
 run() { docker run --rm --platform linux/amd64 -v "$root:/repo:ro" -w /repo "$image" pwsh -NoProfile -NonInteractive -Command "$1"; }
 run '$c = New-PesterConfiguration; $c.Run.Path = "tests/install"; $c.Run.Exit = $true; $c.Output.Verbosity = "Detailed"; Invoke-Pester -Configuration $c'
 [[ ${1:-} == --pester ]] && exit 0
-run '$ErrorActionPreference = "Stop"; $r = @(foreach ($f in "install.ps1", "tests/install/install.Tests.ps1") { Invoke-ScriptAnalyzer -Path $f -Settings tests/install/PSScriptAnalyzerSettings.psd1 }); if ($r.Count) { $r | Format-Table -AutoSize -Wrap | Out-String -Width 200 | Write-Host; exit 1 }; Write-Host "PSScriptAnalyzer: no findings"'
+run '$ErrorActionPreference = "Stop"; $r = @(foreach ($f in "install.ps1", "tests/install/install.Tests.ps1", "tests/install/run-windows.ps1") { Invoke-ScriptAnalyzer -Path $f -Settings tests/install/PSScriptAnalyzerSettings.psd1 }); if ($r.Count) { $r | Format-Table -AutoSize -Wrap | Out-String -Width 200 | Write-Host; exit 1 }; Write-Host "PSScriptAnalyzer: no findings"'
