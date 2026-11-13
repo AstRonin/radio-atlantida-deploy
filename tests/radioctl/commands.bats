@@ -397,17 +397,35 @@ first_run_setup() {
 # --------------------------------------------------------------------- status
 
 @test "status shows the release, air state and pending maintenance" {
-  jq '.pending_maintenance = ["liquidsoap image a -> b"]' "$ROOT/state.json" >"$ROOT/s" && mv "$ROOT/s" "$ROOT/state.json"
   run radioctl status
   [ "$status" -eq 0 ]
   assert_contains "$output" "running   1.0.0"
   assert_contains "$output" "release.env 1.0.1"
   assert_contains "$output" "broadcast connected"
   assert_contains "$output" "control link true, output connected, queued 3"
-  assert_contains "$output" "liquidsoap image a -> b"
+  [[ $output == *"Pending maintenance"$'\n'"    none"* ]]
   assert_contains "$output" "$ROOT/media ok"
   local re='[0-9]+% free, [0-9]+\.[0-9] GB'
   [[ $output =~ $re ]]
+}
+
+@test "status compares pending maintenance now, without an update" {
+  local before
+  before=$(sha256sum "$ROOT/state.json")
+  printf '# a changed comment\n' >>"$ROOT/config/liquidsoap/radio.liq"
+  run radioctl status
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "liquidsoap script config/liquidsoap/radio.liq changed"
+  # Read-only: the recorded list is not rewritten.
+  [ "$before" = "$(sha256sum "$ROOT/state.json")" ]
+}
+
+@test "status falls back to the recorded pending maintenance when compose does not answer" {
+  jq '.pending_maintenance = ["liquidsoap image a -> b"]' "$ROOT/state.json" >"$ROOT/s" && mv "$ROOT/s" "$ROOT/state.json"
+  stub_rc compose_config 1
+  run radioctl status
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "liquidsoap image a -> b"
 }
 
 @test "status reports a missing media mount" {

@@ -2351,9 +2351,17 @@ cmd_status() {
     say "    control link $(jq -r '.control_link.connected' <<<"$body"), output $(jq -r '.output.state // "unknown"' <<<"$body"), queued $(jq '(.queued // []) | length' <<<"$body")"
   fi
 
+  # Compared now, as maintenance does (a changed radio.liq or Icecast source
+  # password in .env shows before the next update); read-only, so the list
+  # recorded by the last update is the fallback when compose does not answer.
   say "Pending maintenance"
-  local p line
-  p=$(state_get '.pending_maintenance // [] | .[]')
+  local p line infra
+  if installed && [[ -n $(state_get '.applied.liquidsoap_image // empty') ]] &&
+    [[ -f $APPLIED_ENV && -f $NETWORK_ENV ]] && infra=$(infra_now); then
+    p=$(pending_list "$infra")
+  else
+    p=$(state_get '.pending_maintenance // [] | .[]')
+  fi
   if [[ -z $p ]]; then
     say "    none"
   else
