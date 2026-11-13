@@ -28,8 +28,10 @@ usage() {
 Usage: tests/liquidsoap/run.sh [--ref REF] [--backend-dir DIR] [--check-only]
 
   --ref REF          backend tag or commit of the smoke tool (default:
-                     $BACKEND_REF, else v${BACKEND_TAG} from release.env);
-                     use the ref config/liquidsoap/radio.liq was taken from
+                     $BACKEND_REF, else v${BACKEND_TAG} from release.env if
+                     the tag exists, else BACKEND_SOURCE_COMMIT of
+                     config/backend-source.env); use the ref
+                     config/liquidsoap/radio.liq was taken from
   --backend-dir DIR  take the smoke tool from a local backend checkout
                      (git archive REF) instead of github.com
                      (default: $BACKEND_DIR)
@@ -50,7 +52,7 @@ while (($#)); do
   esac
 done
 if [[ -z "$ref" ]] && ! $check_only; then
-  ref=$(default_backend_ref "$root")
+  ref=$(default_backend_ref "$root" "$local_dir")
 fi
 
 project=radio-deploy-liqsmoke

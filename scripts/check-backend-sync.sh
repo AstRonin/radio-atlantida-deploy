@@ -30,7 +30,8 @@ usage() {
 Usage: scripts/check-backend-sync.sh [--ref REF] [--backend-dir DIR] [--update]
 
   --ref REF          backend tag or commit (default: $BACKEND_REF, else
-                     v${BACKEND_TAG} from release.env)
+                     v${BACKEND_TAG} from release.env if the tag exists, else
+                     BACKEND_SOURCE_COMMIT of config/backend-source.env)
   --backend-dir DIR  read a local backend checkout (git archive REF) instead
                      of fetching github.com (default: $BACKEND_DIR)
   --update           write config/ from the backend instead of checking it
@@ -50,7 +51,7 @@ while (($#)); do
   esac
 done
 if [[ -z "$ref" ]]; then
-  ref=$(default_backend_ref "$root")
+  ref=$(default_backend_ref "$root" "$local_dir")
 fi
 
 work=$(mktemp -d)
@@ -127,8 +128,8 @@ if $update; then
   cat >"$root/config/backend-source.env" <<EOF
 # The backend commit config/ was taken from, written by
 # scripts/check-backend-sync.sh --update (deploy-init-plan.md D3). Until the
-# release tag v\${BACKEND_TAG} exists, check with
-#   scripts/check-backend-sync.sh --ref <BACKEND_SOURCE_COMMIT>
+# release tag v\${BACKEND_TAG} exists, the checks and CI use
+# BACKEND_SOURCE_COMMIT as the backend ref (scripts/lib/backend-source.sh).
 BACKEND_SOURCE_REF=$ref
 BACKEND_SOURCE_COMMIT=$commit
 EOF
