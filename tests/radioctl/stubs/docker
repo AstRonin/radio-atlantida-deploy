@@ -139,7 +139,7 @@ db_exec() {
       answer pg_restore
       ;;
     *"schema_migrations') IS NOT NULL"*) answer db_has_migrations t ;;
-    *"version || ' ' || dirty"*) answer db_version "22 f" ;;
+    *"FROM schema_migrations LIMIT 1"*) answer db_version "22 f" ;;
     *"schema_compat') IS NOT NULL"*) answer db_has_compat t ;;
     *"min_app_version FROM schema_compat"*) answer db_min_app 1.0.0 ;;
     *) exit 0 ;;

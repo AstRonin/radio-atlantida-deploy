@@ -569,12 +569,15 @@ fetch_repo() {
 DB_DIRTY=f
 DB_SCHEMA_VERSION=0
 DB_MIN_APP=1.0.0
+# "<version> t|f". A boolean cast to text is 'true'/'false', not psql's t/f
+# display, hence the CASE.
+SCHEMA_VERSION_SQL="SELECT version || ' ' || CASE WHEN dirty THEN 't' ELSE 'f' END FROM schema_migrations LIMIT 1"
 
 read_db_state() {
   local out
   out=$(db_sql "SELECT to_regclass('public.schema_migrations') IS NOT NULL") || die "cannot read the database (db); see $LOG_REL"
   if [[ $out == t ]]; then
-    out=$(db_sql "SELECT version || ' ' || dirty FROM schema_migrations LIMIT 1") || die "cannot read schema_migrations; see $LOG_REL"
+    out=$(db_sql "$SCHEMA_VERSION_SQL") || die "cannot read schema_migrations; see $LOG_REL"
     if [[ -n $out ]]; then
       DB_SCHEMA_VERSION=${out%% *}
       DB_DIRTY=${out##* }
