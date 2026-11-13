@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016 # the PowerShell commands are single-quoted on purpose
 # Runs the Pester tests of install.ps1 and PSScriptAnalyzer on the
 # PowerShell files (deploy-init-plan.md D7 9.1 items 8 and 10) in a pinned
 # PowerShell 7 image. The Windows-only parts are mocked (see
