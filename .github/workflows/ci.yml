@@ -1,0 +1,148 @@
+# Every change to this repository is checked before it reaches the station
+# (deploy-init-plan.md D7 9.1). Each job runs scripts of this repository, so
+# the same checks run on the developer's Mac (README, "Tests and CI").
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The backend ref of the sync check and the Liquidsoap smoke test, set in
+  # this one place. Empty: v${BACKEND_TAG} of release.env when that tag
+  # exists in the backend repository, else BACKEND_SOURCE_COMMIT of
+  # config/backend-source.env, with a warning (scripts/backend-ref.sh).
+  # Set a tag or commit here only to test against another backend ref.
+  BACKEND_REF: ""
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: line endings, BOM, and paths
+        run: scripts/check-line-endings.sh
+      - name: shellcheck
+        run: scripts/check-shell.sh
+      - name: actionlint
+        # rhysd/actionlint:1.7.7, multi-arch index digest (checked 2026-11-13).
+        run: >-
+          docker run --rm -v "$PWD:/repo:ro" -w /repo
+          rhysd/actionlint:1.7.7@sha256:887a259a5a534f3c4f36cb02dca341673c6089431057242cdc931e9f133147e9
+          -color
+
+  compose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: compose renders and keeps its rules
+        # NAT and mirrored fixtures, with and without monitoring: images,
+        # published ports, media mounts, health checks.
+        run: scripts/check-compose.sh
+      - name: Loki, Alloy, and Grafana configuration
+        # In the pinned images, as the backend CI checks its dev/ copies.
+        run: scripts/check-config.sh
+
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: release.env
+        # The digests are compared with GHCR when the read-only token is
+        # configured (repository variable GHCR_USER, secret GHCR_READ_TOKEN);
+        # otherwise that part is a warning.
+        env:
+          GHCR_USER: ${{ vars.GHCR_USER }}
+          GHCR_READ_TOKEN: ${{ secrets.GHCR_READ_TOKEN }}
+        run: scripts/check-release.sh
+
+  backend-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: backend ref
+        id: ref
+        run: echo "ref=$(scripts/backend-ref.sh)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v7
+        with:
+          repository: AstRonin/radio-atlantida-backend
+          ref: ${{ steps.ref.outputs.ref }}
+          path: .backend
+      - name: config/ and image pins equal the backend
+        env:
+          REF: ${{ steps.ref.outputs.ref }}
+        run: scripts/check-backend-sync.sh --ref "$REF" --backend-dir .backend
+
+  liquidsoap:
+    # liquidsoap --check accepts scripts that fail only when an encoder
+    # starts, so the production script also runs against a test Icecast,
+    # plain and behind a TLS proxy, with the backend's smoke tool (5.2).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: backend ref
+        id: ref
+        run: echo "ref=$(scripts/backend-ref.sh)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v7
+        with:
+          repository: AstRonin/radio-atlantida-backend
+          ref: ${{ steps.ref.outputs.ref }}
+          path: .backend
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: .backend/go.mod
+          cache-dependency-path: .backend/go.sum
+      - name: liquidsoap --check and runtime smoke test
+        env:
+          REF: ${{ steps.ref.outputs.ref }}
+        run: tests/liquidsoap/run.sh --ref "$REF" --backend-dir .backend
+
+  radioctl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: bats tests of bin/radioctl
+        run: tests/radioctl/run.sh
+
+  distro:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: setup-distro.sh twice, units, systemd-analyze verify
+        run: tests/distro/run.sh
+      - name: the pinned Docker apt install (key, pin, hold)
+        run: tests/distro/run.sh --with-apt
+
+  versions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: install/versions.env pins exist upstream
+        # The rootfs URL, its SHA256SUMS entry, and the downloaded file's
+        # hash; Docker's apt key and every pinned package version.
+        run: scripts/check-versions.sh --download
+
+  install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Pester and PSScriptAnalyzer (PowerShell 7, Linux)
+        run: tests/install/run.sh
+
+  windows:
+    # The same Pester tests and PSScriptAnalyzer settings under Windows
+    # PowerShell 5.1, the PowerShell install.ps1 runs with on the station.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Pester and PSScriptAnalyzer (Windows PowerShell 5.1)
+        shell: powershell
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\install\run-windows.ps1
