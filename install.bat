@@ -9,6 +9,8 @@ rem   install.bat -DryRun            show every step and its check, change nothi
 rem   install.bat -CreateAccount     create the local administrator radio first
 rem   install.bat -MediaFolder "D:\RadioAtlantida\media" -InstallRoot D:\RadioAtlantida
 rem   install.bat -MinFreeGB 15         a lower free space minimum (default 20 GB), on purpose
+rem   install.bat -UseLocalVersions  install this copy's install\versions.env even if the
+rem                                  deploy repository inside WSL pins other versions
 rem
 rem Keeps install.ps1's exit code; pauses only when started by double-click.
 setlocal

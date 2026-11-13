@@ -263,6 +263,7 @@ Options of `install.bat` (type them after `install.bat`):
 | `-InstallRoot D:\RadioAtlantida` | install folder (default `C:\RadioAtlantida`); the virtual disk goes to `<InstallRoot>\wsl` |
 | `-ActiveHoursStart 6 -ActiveHoursEnd 0` | the active hours, without the question |
 | `-MinFreeGB 15` | the free space a first install needs (default 20 GB); a lower value continues on purpose, with a warning |
+| `-UseLocalVersions` | install the versions pinned in this copy's `install\versions.env` even though the copy inside the distribution pins other ones (6.3); only on the developer's advice |
 
 Every run writes a log: `C:\ProgramData\RadioAtlantida\logs\install-<UTC time>.log`.
 The finished steps are recorded in `C:\ProgramData\RadioAtlantida\install-state.json`.
@@ -274,6 +275,7 @@ The finished steps are recorded in `C:\ProgramData\RadioAtlantida\install-state.
 | Preflight | checks Windows build and update level, edition, newest update (KB) and its date, ESU status (only logged; an old patch level only warns), 64-bit, virtualization, signed in as `radio`, no Docker Desktop, 20 GB free (`-MinFreeGB`), internet (Ubuntu images, Docker, GHCR, GitHub); on Windows 10 it shows the support note once |
 | Windows features | turns on "Windows Subsystem for Linux" and "Virtual Machine Platform"; restart and resume if needed |
 | WSL | `wsl --update` (the Microsoft Store WSL), WSL 2 as default, at least the version pinned in `install/versions.env` |
+| Pinned versions | when the distribution exists: compares this copy's `install\versions.env` with the one in `/opt/radio-atlantida/deploy` (kept current by `update.bat`); a difference stops the install before any change (6.3) |
 | Network mode | Windows 11 22H2 or later: mirrored; otherwise NAT |
 | `.wslconfig` | in `C:\Users\radio\.wslconfig`: memory half the RAM (4 to 16 GB), processors half the CPUs (at least 2), swap 4 GB, no idle shutdown of the VM; the network mode; your other keys are kept |
 | Folders | checks the media folder; adds a Microsoft Defender exclusion for it and turns off its indexing; creates `C:\RadioAtlantida\backups` (the Windows copy of the backups) |
@@ -514,12 +516,22 @@ These are done in a maintenance window (section 7):
   stops with "Docker Engine is X, install/versions.env pins Y; run
   install.bat". Then:
   1. download this repository again as a ZIP (2.1 step 2) and unpack it
-     over the old copy, so the Windows copy has the new `versions.env`
-     (`install.bat` uses the Windows copy, not the one inside the
-     distribution);
+     over the old copy (or `git pull` in it), so the Windows copy has the
+     new `versions.env`. `install.bat` installs the versions of the Windows
+     copy, not of the one inside the distribution;
   2. run `install.bat` in a maintenance window; it upgrades the engine and
      restarts the containers;
   3. run `update.bat`, then the reboot check (11.2).
+
+  If step 1 is forgotten, `install.bat` notices it: it compares the Windows
+  copy's `install\versions.env` with the one inside the distribution
+  (`/opt/radio-atlantida/deploy/install/versions.env`) and, when they
+  differ, stops before it changes anything with "install\versions.env of
+  this copy ... differs from the deploy repository inside the distribution",
+  naming each differing pin. Do step 1 and run `install.bat` again. If the
+  Windows copy is the newer one (a fresh ZIP, but `update.bat` has not run
+  yet), run `update.bat` first. `install.bat -UseLocalVersions` installs the
+  Windows copy's versions anyway; use it only when the developer says so.
 - **WSL** (`wsl --update`) and **Windows updates**: install by hand in a
   maintenance window, restart, then the reboot check.
 
@@ -736,6 +748,7 @@ Sign in as `radio` and run `update.bat status`.
 | `LOW SPACE` | `update.bat status`, Disk | free space on that Windows drive; see 8.3 for old dumps |
 | `NOT WRITABLE` media folder | the folder's Windows permissions | the station needs to write fixed files there (transcode, "Fix loudness"); tell the developer |
 | "Docker Engine is X, install/versions.env pins Y; run install.bat" | a new `versions.env` came with the repository | 6.3 |
+| `install.bat`: "install\versions.env of this copy ... differs from the deploy repository inside the distribution" | the Windows copy of this repository is out of date (or `update.bat` has not pulled the new one yet) | 6.3 |
 | "another radioctl run holds state.lock" (or it waits) | an update, backup, or drill is running | wait for it to finish |
 
 **Changing the Icecast source password**: see 10.7, step 3.
@@ -895,8 +908,10 @@ after a Windows update or a WSL or Docker Engine upgrade.
       appears in `C:\RadioAtlantida\backups`.
 - [ ] The Pester tests pass under Windows PowerShell 5.1 (CI job `windows`).
 - [ ] An engine upgrade path works: with a changed `install/versions.env`,
-      `update.bat` stops with "run install.bat", `install.bat` from a fresh
-      copy upgrades Docker, and `update.bat` then succeeds (6.3).
+      `update.bat` stops with "run install.bat", `install.bat` from the old
+      Windows copy stops with "differs from the deploy repository inside the
+      distribution", `install.bat` from a fresh copy upgrades Docker, and
+      `update.bat` then succeeds (6.3).
 - [ ] **Cold-reboot test** (11.2) passes.
 
 ### 11.2 Cold-reboot test (the reboot check)

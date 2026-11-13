@@ -47,6 +47,9 @@ BeforeAll {
             Sha           = $script:Versions['UBUNTU_ROOTFS_SHA256']
             Calls         = New-Object System.Collections.Generic.List[string]
             Restarted     = $false
+            # install/versions.env of the deploy repository inside the
+            # distribution (lines; $null: not there yet). Written by the clone.
+            DistroVersions = $null
         }
         # A fresh import: the first setup-distro.sh pass asks for a restart.
         $script:Fake.SetupRc.Enqueue(10)
@@ -107,7 +110,17 @@ BeforeAll {
                         if ($cmd[2] -like '*/.git') { if ($f.RepoCloned) { return (& $ok '') } return (& $rc 1 '') }
                         return (& $ok '')
                     }
-                    'git' { $f.RepoCloned = $true; return (& $ok 'cloned') }
+                    'git' {
+                        if (-not $f.RepoCloned -and $null -eq $f.DistroVersions) {
+                            $f.DistroVersions = @(Get-Content (Join-Path $script:RepoRoot 'install/versions.env'))
+                        }
+                        $f.RepoCloned = $true
+                        return (& $ok 'cloned')
+                    }
+                    'cat' {
+                        if ($cmd[1] -eq '/opt/radio-atlantida/deploy/install/versions.env' -and $null -ne $f.DistroVersions) { return (& $ok $f.DistroVersions) }
+                        return (& $rc 1 'cat: No such file or directory')
+                    }
                     'grep' { return (& $ok @('PANEL_PORT=8080', 'MONITORING_ENABLED=true', 'GRAFANA_PORT=3000')) }
                     'bin/radioctl' {
                         if ($f.FirstRunRc -eq 0) { $f.Installed = $true }
@@ -316,6 +329,12 @@ Describe 'pure logic' {
             @{ Arg = '/mnt/e/Радио'; Quoted = '/mnt/e/Радио' }
         ) {
             ConvertTo-CommandLineArgument $Arg | Should -Be $Quoted
+        }
+        It 'compares versions.env pins: equal, changed, and one-sided keys' {
+            $a = @{ A = '1'; B = '2' }
+            (Compare-VersionsMap -Windows $a -Distro @{ A = '1'; B = '2' }).Count | Should -Be 0
+            (Compare-VersionsMap -Windows $a -Distro @{ A = '1'; B = '3' }) -join ',' | Should -Be 'B'
+            (Compare-VersionsMap -Windows $a -Distro @{ A = '1'; C = '2' }) -join ',' | Should -Be 'B,C'
         }
         It 'forwards the bound parameters to the elevated instance' {
             $b = [ordered]@{ DryRun = [switch]$true; MediaFolder = 'D:\Radio media'; Yes = [switch]$false }
@@ -729,6 +748,93 @@ Describe 'install runs' {
             Invoke-TestInstall | Should -Be 0
             Get-FakeCalls 'INTERACTIVE*first-run*' | Should -HaveCount 1
             Get-FakeCalls '*git -C /opt/radio-atlantida/deploy pull --ff-only' | Should -HaveCount 1
+        }
+    }
+
+    Context 'versions.env of the distribution (engine upgrade)' {
+        BeforeEach {
+            foreach ($k in @($script:Fake.Features.Keys)) { $script:Fake.Features[$k] = 'Enabled' }
+            $script:Fake.Distros = @('radio-atlantida')
+            $script:Fake.Installed = $true
+            $script:Fake.RepoCloned = $true
+            $script:VersionsLines = @(Get-Content (Join-Path $script:RepoRoot 'install/versions.env'))
+            # A newer engine pin pulled by update.bat inside the distribution.
+            $script:NewerLines = @($script:VersionsLines | ForEach-Object { $_ -replace '^DOCKER_CE_VERSION=.*$', 'DOCKER_CE_VERSION=5:29.10.0-1~ubuntu.24.04~noble' })
+        }
+
+        It 'equal pins: no message, the install runs' {
+            # Comments may differ; only the KEY=VALUE pins count.
+            $script:Fake.DistroVersions = @('# another comment') + $script:VersionsLines
+            Invoke-TestInstall | Should -Be 0
+            Get-FakeCalls 'wsl.exe -d radio-atlantida -u radio --exec cat /opt/radio-atlantida/deploy/install/versions.env' | Should -HaveCount 1
+            $log = Get-RunLog
+            $log | Should -Not -Match 'versions\.env of this copy'
+            $log | Should -Not -Match 'UseLocalVersions'
+            $log | Should -Not -Match 'STOPPED'
+        }
+
+        It 'different pins: stops in preflight before any change, with what to do' {
+            $script:Fake.DistroVersions = $script:NewerLines
+            Invoke-TestInstall | Should -Be 1
+            $log = Get-RunLog
+            $log | Should -Match 'STOPPED: install\\versions\.env of this copy .* differs from the deploy repository inside the distribution \(/opt/radio-atlantida/deploy/install/versions\.env\)'
+            $log | Should -Match 'DOCKER_CE_VERSION: this copy 5:29\.9\.3-1~ubuntu\.24\.04~noble, distribution 5:29\.10\.0-1~ubuntu\.24\.04~noble'
+            $log | Should -Match 'Get a fresh copy of the deploy repository on Windows \(download the ZIP again'
+            $log | Should -Match 'install\.bat -UseLocalVersions'
+            Get-FakeCalls '*setup-distro.sh*' | Should -HaveCount 0
+            Get-FakeCalls '*--exec cp *' | Should -HaveCount 0
+            Get-FakeCalls '*--shutdown*' | Should -HaveCount 0
+            Should -Invoke Set-RegistryValue -Times 0
+            Should -Invoke Register-TaskFromXml -Times 0
+        }
+
+        It 'a key only on one side counts as different' {
+            $script:Fake.DistroVersions = $script:VersionsLines + @('NEW_PIN=1')
+            Invoke-TestInstall | Should -Be 1
+            Get-RunLog | Should -Match 'NEW_PIN: this copy \(none\), distribution 1'
+        }
+
+        It 'different pins with -UseLocalVersions: a warning, the install runs with this copy' {
+            $script:Fake.DistroVersions = $script:NewerLines
+            Invoke-TestInstall -Options @{ UseLocalVersions = $true } | Should -Be 0
+            $log = Get-RunLog
+            $log | Should -Match 'WARNING: -UseLocalVersions: installing the pins of this copy''s install\\versions\.env'
+            $log | Should -Not -Match 'STOPPED'
+            @(Get-FakeCalls '*setup-distro.sh*').Count | Should -BeGreaterThan 0
+        }
+
+        It 'different pins in a dry run: only a warning' {
+            $script:Fake.DistroVersions = $script:NewerLines
+            Invoke-TestInstall -Options @{ DryRun = $true } | Should -Be 0
+            Get-RunLog | Should -Match 'WARNING: install\\versions\.env of this copy'
+        }
+
+        It 'no distribution: nothing is compared' {
+            $script:Fake.Distros = @()
+            $script:Fake.Installed = $false
+            $script:Fake.RepoCloned = $false
+            $script:Fake.DistroVersions = $script:NewerLines
+            Invoke-TestInstall | Should -Be 0
+            # The fresh clone brings this copy's pins.
+            Get-FakeCalls '*--exec cat *' | Should -HaveCount 0
+            Get-RunLog | Should -Not -Match 'versions\.env of this copy'
+        }
+
+        It 'a distribution without the deploy repository yet: nothing is compared' {
+            $script:Fake.Installed = $false
+            $script:Fake.RepoCloned = $false
+            $script:Fake.DistroVersions = $null
+            Invoke-TestInstall | Should -Be 0
+            Get-FakeCalls '*--exec cat *' | Should -HaveCount 1
+            Get-RunLog | Should -Match 'not readable \(no deploy repository yet\): versions not compared'
+            Get-RunLog | Should -Not -Match 'STOPPED'
+        }
+
+        It 'the resume task keeps -UseLocalVersions' {
+            $script:Fake.Distros = @()
+            $script:Fake.Features['VirtualMachinePlatform'] = 'Disabled'
+            Invoke-TestInstall -Options @{ UseLocalVersions = $true } | Should -Be 3010
+            $script:Fake.Tasks[$script:ResumeTaskName] | Should -Match '-Resume -InstallRoot .* -UseLocalVersions'
         }
     }
 

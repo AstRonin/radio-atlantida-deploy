@@ -114,7 +114,11 @@ window; a backend below `min-backend` is refused.
 
 A change of `install/versions.env` (Docker Engine, Compose, the Ubuntu
 image) is applied with `install.bat` in a maintenance window (runbook
-§6.3); `radioctl` refuses to update until the engine matches.
+§6.3); `radioctl` refuses to update until the engine matches. `install.bat`
+installs the pins of its own (Windows) copy of this repository and stops
+when they differ from the copy inside the distribution, which `update.bat`
+keeps current, so a stale Windows copy cannot install old versions
+(`-UseLocalVersions` overrides it on purpose).
 
 ## `radioctl` dry-run and test switches
 

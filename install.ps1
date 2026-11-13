@@ -49,6 +49,10 @@
     Free space in GB the drive of InstallRoot needs for a first install
     (default 20). A lower value lets a first install continue on purpose, with
     a warning. An existing distribution only warns below it.
+.PARAMETER UseLocalVersions
+    Install the pins of this copy's install\versions.env even when the deploy
+    repository inside the distribution (which update.bat keeps current) has
+    other ones. Without it such a difference stops the install.
 .PARAMETER Elevated
     Internal: set by the self-elevation, so the elevated window waits for
     Enter before it closes.
@@ -66,6 +70,7 @@ param(
     [string]$AccountName = 'radio',
     [string]$RepoUrl = 'https://github.com/AstRonin/radio-atlantida-deploy',
     [ValidateRange(1, 100000)][int]$MinFreeGB = 20,
+    [switch]$UseLocalVersions,
     [switch]$Elevated
 )
 
@@ -240,6 +245,18 @@ function ConvertFrom-KeyValueText {
         }
     }
     return $map
+}
+
+# Compare-VersionsMap: the keys (sorted) whose values differ between two
+# parsed versions.env files; a key missing on one side counts as different.
+function Compare-VersionsMap {
+    param([Parameter(Mandatory)][hashtable]$Windows, [Parameter(Mandatory)][hashtable]$Distro)
+    $keys = @(@($Windows.Keys) + @($Distro.Keys) | Sort-Object -Unique)
+    $diff = @()
+    foreach ($k in $keys) {
+        if (-not $Windows.ContainsKey($k) -or -not $Distro.ContainsKey($k) -or [string]$Windows[$k] -cne [string]$Distro[$k]) { $diff += $k }
+    }
+    return , $diff
 }
 
 # Get-VmMemoryGB: the WSL VM's memory for a machine with $RamGB of RAM: half
@@ -964,6 +981,7 @@ function Initialize-Context {
     if ($Options.ContainsKey('MinFreeGB') -and [int]$Options['MinFreeGB'] -gt 0) { $minFree = [int]$Options['MinFreeGB'] }
     $ctx = @{
         MinFreeGB        = $minFree
+        UseLocalVersions = [bool]$Options['UseLocalVersions']
         DryRun           = [bool]$Options['DryRun']
         Resume           = [bool]$Options['Resume']
         Yes              = [bool]$Options['Yes']
@@ -1017,6 +1035,54 @@ function Test-StackInstalled {
     $r = Invoke-Wsl -ArgumentList @('-d', $script:DistroName, '-u', 'radio', '--exec', 'jq', '-e', '.current.backend_tag',
         ($script:LinuxDeployDir + '/state.json'))
     return ($r.ExitCode -eq 0)
+}
+
+# Invoke-VersionsCheck: install.ps1 installs the pins of this Windows copy's
+# install\versions.env, but update.bat keeps the deploy repository inside the
+# distribution current (git pull), so after an engine pin change the Windows
+# copy can be the older one (or, before update.bat pulled, the newer one).
+# When the distribution and its copy exist and the pins differ, the install
+# stops before any change (a dry run only warns), unless -UseLocalVersions.
+# No distribution, or no deploy repository in it yet: nothing to compare.
+# Runs as its own step after WSL is ready and before the first step that can
+# stop WSL. Running setup-distro.sh from the distribution's copy instead was
+# rejected: install.ps1 and its other inputs (WSL_MIN_VERSION, the rootfs
+# pins, update.bat, docker-compose.yml) would still come from this copy, so
+# two versions of the installer would mix; and the distribution's copy is
+# not always the newer one.
+function Invoke-VersionsCheck {
+    if (-not (Test-DistroExists)) {
+        Write-InstallLog '    no distribution yet: versions not compared'
+        return
+    }
+    $path = $script:LinuxDeployDir + '/install/versions.env'
+    $r = Invoke-Wsl -ArgumentList @('-d', $script:DistroName, '-u', 'radio', '--exec', 'cat', $path)
+    if ($r.ExitCode -ne 0) {
+        Write-InstallLog "    $path not readable (no deploy repository yet): versions not compared"
+        return
+    }
+    $distro = ConvertFrom-KeyValueText $r.Output
+    $diff = Compare-VersionsMap -Windows $script:Ctx.Versions -Distro $distro
+    if ($diff.Count -eq 0) {
+        Write-InstallLog "    the pins equal $path"
+        return
+    }
+    $detail = @($diff | ForEach-Object {
+            $w = '(none)'; $d = '(none)'
+            if ($script:Ctx.Versions.ContainsKey($_)) { $w = $script:Ctx.Versions[$_] }
+            if ($distro.ContainsKey($_)) { $d = $distro[$_] }
+            ('{0}: this copy {1}, distribution {2}' -f $_, $w, $d)
+        })
+    if ($script:Ctx.UseLocalVersions) {
+        Write-Warn ('-UseLocalVersions: installing the pins of this copy''s install\versions.env, which differ from {0} ({1})' -f $path, ($detail -join '; '))
+        return
+    }
+    $msg = ('install\versions.env of this copy ({0}) differs from the deploy repository inside the distribution ({1}): {2}. ' -f $script:Ctx.RepoRoot, $path, ($detail -join '; ')) +
+    'install.bat installs the pins of this copy, so this copy is out of date. Get a fresh copy of the deploy repository on Windows ' +
+    '(download the ZIP again and unpack it over this folder, or git pull in it; runbook 6.3) and run install.bat again. ' +
+    'If this copy is the newer one, run update.bat first (it pulls the repository inside the distribution). ' +
+    'To install the pins of this copy on purpose: install.bat -UseLocalVersions. Nothing was changed.'
+    if ($script:Ctx.DryRun) { Write-Warn $msg } else { Stop-Install $msg }
 }
 
 # Confirm-AirInterruption: a step that stops WSL on a machine whose stack is
@@ -1111,6 +1177,7 @@ function Invoke-Features {
     $bat = Join-Path $script:Ctx.RepoRoot 'install.bat'
     $extra = ''
     if ($script:Ctx.MinFreeGB -ne $script:DefaultMinFreeGB) { $extra = ' -MinFreeGB {0}' -f $script:Ctx.MinFreeGB }
+    if ($script:Ctx.UseLocalVersions) { $extra += ' -UseLocalVersions' }
     $arguments = ('/c ""{0}" -Resume -InstallRoot "{1}"{2}"' -f $bat, $script:Ctx.InstallRoot, $extra)
     Register-TaskFromXml -Name $script:ResumeTaskName -Xml (New-ResumeTaskXml -UserId (Get-KeepAliveUserId) -Command $cmd -Arguments $arguments)
     Write-Info '    Windows must restart to finish enabling WSL. After the restart, sign in as'
@@ -1470,12 +1537,17 @@ function Write-Summary {
     Write-Info ('    Log: {0}' -f $script:Ctx.LogFile)
 }
 
-# Get-InstallSteps: the steps of plan 6.2 in order.
+# Steps that only check (they also run in a dry run and are not recorded).
+$script:CheckOnlySteps = @('preflight', 'versions')
+
+# Get-InstallSteps: the steps of plan 6.2 in order. The versions check runs
+# once WSL works and before the first step that can stop WSL (.wslconfig).
 function Get-InstallSteps {
     return @(
         @{ Name = 'preflight'; Title = 'Preflight'; Check = $null; Apply = { Invoke-Preflight } },
         @{ Name = 'features'; Title = 'Windows features (WSL, Virtual Machine Platform)'; Check = { Test-FeaturesEnabled }; Apply = { Invoke-Features } },
         @{ Name = 'wsl'; Title = 'WSL (Store version)'; Check = { Test-WslReady }; Apply = { Invoke-WslSetup } },
+        @{ Name = 'versions'; Title = 'Pinned versions (install\versions.env)'; Check = $null; Apply = { Invoke-VersionsCheck } },
         @{ Name = 'network-mode'; Title = 'Network mode'; Check = { Test-NetworkModeRecorded }; Apply = { Invoke-NetworkMode } },
         @{ Name = 'wslconfig'; Title = '.wslconfig'; Check = { Test-WslConfig }; Apply = { Invoke-WslConfig } },
         @{ Name = 'folders'; Title = 'Media folder and Windows backup folder'; Check = { Test-Folders }; Apply = { Invoke-Folders } },
@@ -1514,7 +1586,7 @@ function Invoke-InstallSteps {
         }
         if ($script:Ctx.DryRun) {
             if ($null -eq $s.Check) {
-                if ($s.Name -eq 'preflight') { & $s.Apply | Out-Null; continue }
+                if ($s.Name -in $script:CheckOnlySteps) { & $s.Apply | Out-Null; continue }
                 Write-Info '    [dry-run] would run (this step runs every time; it is idempotent)'
             }
             else { Write-Info '    [dry-run] not in place: would run' }
@@ -1527,7 +1599,7 @@ function Invoke-InstallSteps {
             else { Write-Info '    Restart Windows later; the install continues at the next sign-in of radio.' }
             return 3010
         }
-        if ($s.Name -ne 'preflight') { Set-StepDone $s.Name }
+        if ($s.Name -notin $script:CheckOnlySteps) { Set-StepDone $s.Name }
     }
     Write-StepTitle 'Summary'
     if ($script:Ctx.DryRun) { Write-Info '    DRY RUN: nothing was changed.' }
@@ -1592,7 +1664,7 @@ function Invoke-Main {
     $opts = @{
         DryRun = $DryRun; Resume = $Resume; Yes = $Yes; InstallRoot = $InstallRoot; MediaFolder = $MediaFolder
         ActiveHoursStart = $ActiveHoursStart; ActiveHoursEnd = $ActiveHoursEnd; AccountName = $AccountName; RepoUrl = $RepoUrl
-        MinFreeGB = $MinFreeGB
+        MinFreeGB = $MinFreeGB; UseLocalVersions = $UseLocalVersions
     }
     $code = 1
     try {
