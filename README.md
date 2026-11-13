@@ -6,8 +6,8 @@ backend and frontend run as prebuilt images from GitHub Container Registry.
 
 The runbook (install, update, rollback, restore, maintenance, backups) is
 written in Phase D7 of `docs/deploy-init-plan.md`. Until then, see that plan
-and `docs/tech-design.md` §9. The sections below (Phases D3, D5, and D6)
-become part of it.
+and `docs/tech-design.md` §9. The sections below (Phases D3 to D6) become
+part of it.
 
 ## Production playout script
 
@@ -120,8 +120,9 @@ undone. Broadcasting continues on Y. Send the log ... to the developer." A
 migration exit 5 (dirty) restores the pre-update dump automatically; a
 failed health gate reinstalls the previous release by digest.
 
-Not in this version: `install.ps1`, `setup-distro.sh`, and
-`radio-network.service`, which writes `runtime/network.env` (Phase D4).
+`runtime/network.env` (`LIVE_UDP_BIND`, `LIVE_PUBLIC_IPS`) is written by
+`radioctl network`, which `radio-network.service` runs at every boot (see
+"Host install" below).
 
 ## Backups (`update.bat backup`, `update.bat restore-drill`)
 
@@ -203,3 +204,193 @@ Dry-run switches (environment only, never `.env`): `COMPOSE_PROJECT_NAME`,
 `RADIOCTL_BACKEND_IMAGE`, `RADIOCTL_FRONTEND_IMAGE` (a test registry),
 `RADIOCTL_COMPOSE_OVERRIDE` (an extra compose file), `RADIOCTL_HEALTH_TIMEOUT`,
 `RADIOCTL_LOCK_WAIT`, `RADIOCTL_FAKE_CLOCK` (tests).
+
+## Host install (`install.bat`, Phase D4)
+
+The station machine runs Windows 10 (21H2, build 19044.2311 or later, with
+the Microsoft Store WSL; Home is enough) or Windows 11, x64, virtualization
+on, at least 16 GB RAM and 100 GB free on the drive of the distribution.
+Docker Desktop must not be installed.
+
+1. Create the dedicated local administrator account once, from any
+   administrator account: `install.bat -CreateAccount` (the password is
+   typed twice and never logged; it never expires).
+2. Sign in to Windows as `radio`, download this repository (ZIP or `git
+   clone`), and double-click `install.bat`. It elevates itself (UAC prompt).
+3. If Windows features had to be enabled, it asks to restart. After the
+   restart, sign in as `radio`: the install continues by itself (one-shot
+   logon task "Radio Atlantida install resume", deleted when it continues).
+4. Answer its questions: the station's Windows media folder (default
+   `D:\RadioAtlantida\media`), the Windows Update active hours (default
+   06:00-24:00, at most 18 hours), the Windows password of `radio` (stored
+   only by Task Scheduler for the boot task), and then the questions of
+   `radioctl first-run` (registry user and read token, the Icecast source
+   password, the stream settings). The Grafana admin password is shown once.
+
+Options: `-DryRun` (check every step, change nothing), `-Yes` (accept the
+defaults of the media folder and active hours questions), `-MediaFolder
+<path>`, `-InstallRoot <folder>` (default `C:\RadioAtlantida`, the virtual
+disk of the distribution goes to `<InstallRoot>\wsl`), `-ActiveHoursStart`,
+`-ActiveHoursEnd`. Every run writes
+`C:\ProgramData\RadioAtlantida\logs\install-<UTC>.log`; the finished steps
+are in `C:\ProgramData\RadioAtlantida\install-state.json`. A second run
+checks every step against the real state and changes nothing; it re-applies
+`install/versions.env` (a Docker Engine upgrade is a new `versions.env` and
+an `install.bat` run in a maintenance window). A step that would stop WSL
+on an installed station (a changed `.wslconfig` or `/etc/wsl.conf`) asks
+first, because it interrupts the air.
+
+What `install.ps1` does, in order (plan 6.2):
+
+| Step | What |
+|------|------|
+| Preflight | build and update level, edition, newest KB with its date, ESU status (logged; an old patch level only warns), x64, virtualization, signed in as `radio`, no Docker Desktop, disk space, internet (Ubuntu images, Docker apt, GHCR, GitHub); the Windows 10 support note once |
+| Windows features | `Microsoft-Windows-Subsystem-Linux`, `VirtualMachinePlatform` (`dism.exe`); restart and resume if needed |
+| WSL | `wsl --update` (Store, else `--web-download`), `wsl --set-default-version 2`, `wsl --version` at least `WSL_MIN_VERSION` |
+| Network mode | Windows 11 22H2+ (build 22621): `mirrored`; otherwise `nat` |
+| `.wslconfig` | `[wsl2]` `memory=8GB`, `processors` = half the CPUs (at least 2), `swap=4GB`, `vmIdleTimeout=-1`; NAT: `localhostForwarding=true`; mirrored: `networkingMode=mirrored`; other keys kept |
+| Folders | the media folder must exist on a fixed, internal, local NTFS drive (no share, mapped, removable, or USB drive); Defender exclusion; indexing off; `C:\RadioAtlantida\backups` (the Windows copy of the backups) |
+| Distribution | the pinned Ubuntu 24.04 rootfs (`versions.env`), SHA-256 checked, `wsl --import radio-atlantida <InstallRoot>\wsl ... --version 2`; an existing distribution is kept |
+| Linux half | copies `install/` and `docker-compose.yml` to `/var/lib/radio-atlantida/src`, runs `setup-distro.sh` as root, restarts the distribution when it asks (exit 10), runs it again |
+| Keep-alive task | "Radio Atlantida WSL": at boot and every 5 minutes, as `radio` whether signed in or not, `wsl.exe -d radio-atlantida -u radio --exec /usr/local/bin/radio-keepalive`, no time limit, one instance, restart on failure |
+| Host settings | no sleep, hibernation, or disk timeout on AC; hibernation and Fast Startup off; active hours; Windows Time automatic with NTP; no Pro-only update policy |
+| Deploy repository | `git clone` to `/opt/radio-atlantida/deploy` as `radio`, `systemctl start radio-network.service`, `bin/radioctl first-run --media-root /mnt/<drive>/...` |
+| Shortcuts | "Radio panel", "Radio media", "Radio update" (`<InstallRoot>\update.bat`), "Radio Grafana" when monitoring is on |
+
+`install/setup-distro.sh` (root, idempotent): `/etc/wsl.conf` from
+`install/wsl.conf` (systemd, default user `radio`, no Windows `PATH`, drive
+mount `uid=1000,gid=10001,umask=002,fmask=002` without `metadata`); user
+`radio` (uid 1000; the stock `ubuntu` user of the image is renamed), group
+`radio-media` (gid 10001), `radio` in `radio-media` and `docker`; base
+packages (with `tzdata`: the timers name `Asia/Yerevan`); Docker's apt
+repository with the pinned key fingerprint, `docker-ce`, `docker-ce-cli`,
+`containerd.io`, `docker-compose-plugin`, `docker-buildx-plugin` at the
+pinned versions with an apt pin (`/etc/apt/preferences.d/radio-atlantida-docker`)
+and `apt-mark hold`; `unattended-upgrades` for Ubuntu security updates only,
+no reboot; `/etc/docker/daemon.json` (json-file 10m x 3, userland proxy on);
+`/srv/radio/journal` (owned by the user of the pinned Liquidsoap image),
+`/srv/radio/backups` (`radio`, 0700), `/opt/radio-atlantida` (`radio`);
+`/etc/radio-atlantida/host.env` (`RADIO_NETWORK_MODE`);
+`/usr/local/bin/radio-keepalive`; the units (`install/systemd/install-units.sh`).
+On a fresh import the first pass runs without systemd and exits 10; the
+second pass, under systemd, starts Docker and checks systemd, the Docker and
+Compose versions, and that `radio` can create and rename a file in the
+media folder.
+
+At boot, with nobody signed in: the keep-alive task starts the distribution
+(its `wsl.exe` stays, as `sleep infinity`, so WSL does not stop the idle
+distribution) -> WSL mounts the Windows drives -> systemd starts Docker ->
+`radio-network.service` (`radioctl network`) writes `runtime/network.env`:
+in NAT mode `LIVE_UDP_BIND=0.0.0.0` and `LIVE_PUBLIC_IPS=<eth0 address>`
+(it changes at every boot), in mirrored mode `127.0.0.1` for both; it
+recreates `backend` only when the running container was created with other
+values -> Docker starts the containers (`restart: unless-stopped`) ->
+`radio-boot-check.service` (`radioctl boot-check`) waits up to 10 minutes
+and writes `logs/boot-<UTC>.log`, whose last line `update.bat status`
+shows: `ok: stack healthy at VM uptime N s (target 300s)`, `LATE: ...`, or
+`FAILED: ...` with the services that were not healthy. `radio-keepalive`
+writes one line per start to `logs/keepalive.log`.
+
+The panel is `http://127.0.0.1:8080` (a secure context, so the microphone
+works without HTTPS); live voice goes to `LIVE_PUBLIC_IPS:8189/udp`. Nothing
+is reachable from the LAN.
+
+BIOS/UEFI (by hand, not scripted): "Restore on AC power loss: Power On",
+virtualization (VT-x/AMD-V) enabled; a UPS is recommended. **Never run `wsl
+--unregister radio-atlantida`** (it deletes the database and the backups
+inside the virtual disk).
+
+Security note: without ESU, Windows 10 gets no more security fixes since
+14 October 2025. The station exposes no inbound port; do not use the machine
+for email or browsing. An upgrade to Windows 11 is recommended later;
+`install.bat` then switches to mirrored networking by itself. If ESU is
+enrolled, use "Pause updates" and install updates by hand in a maintenance
+window, followed by the reboot check.
+
+Tests (Docker; nothing here runs Windows itself):
+
+```sh
+tests/install/run.sh            # Pester 5.7.1 tests of install.ps1 (75, Windows mocked) and PSScriptAnalyzer 1.25.0, PowerShell 7.5
+tests/distro/run.sh             # setup-distro.sh twice in ubuntu:24.04 (files, users, units), systemd-analyze verify
+tests/distro/run.sh --with-apt  # also the pinned Docker apt install (key, pin, hold); slow
+tests/radioctl/run.sh -f network  # radioctl network, boot-check, the units, radio-keepalive
+```
+
+### D4 acceptance on Windows
+
+These could not be tested on the Mac; each is marked "(verify on Windows)"
+in the code or the plan. Run them on a Windows 10 machine of the production
+build (or the production machine before air), and again after a Windows
+update or a WSL or Docker Engine upgrade.
+
+- [ ] A full install from a fresh Windows, with the features restart and the
+      resume (the resume task runs elevated at logon and is deleted), finishes.
+- [ ] A second `install.bat` run changes nothing (log: every step skipped,
+      `setup-distro: nothing to change.`); `install.bat -DryRun` changes nothing.
+- [ ] Self-elevation keeps the account `radio`; the elevated window waits for
+      Enter at the end.
+- [ ] The Store WSL on the production build: `wsl --version` prints at least
+      `WSL_MIN_VERSION` after `wsl --update` (or `--web-download`).
+- [ ] `wsl --import` of the pinned rootfs works on Windows 10 with
+      `--version 2` and shows no first-run dialog.
+- [ ] systemd runs in the distribution (`systemctl is-system-running`:
+      running, or degraded with only known units); Docker and Compose are the
+      pinned versions.
+- [ ] `.wslconfig`: the installed WSL accepts every key without a warning
+      (`memory`, `processors`, `swap`, `vmIdleTimeout`, `localhostForwarding`;
+      `networkingMode` only in mirrored mode).
+- [ ] `Register-ScheduledTask` accepts the keep-alive XML; the task runs as
+      `radio` whether signed in or not (password stored), and WSL starts from
+      it without a sign-in. Fallback if not: Sysinternals Autologon for
+      `radio`, a lock-screen policy, and an "at logon" trigger.
+- [ ] No idle shutdown: with nobody signed in, the stack still runs 30 minutes
+      after boot (`logs/keepalive.log` has one line per boot); without the
+      keep-alive task, WSL would stop the distribution (confirms 6.4).
+- [ ] The manager's sign-in as `radio` joins the same running VM
+      (`update.bat status` shows the containers started at boot).
+- [ ] NAT mode: the panel `http://127.0.0.1:8080` and Grafana
+      `http://127.0.0.1:3000` open in the Windows browser through localhost
+      forwarding of the `docker-proxy` sockets on the VM's `127.0.0.1` (if
+      not: bind them to the VM address, plan 6.5 fallback).
+- [ ] A live voice session from the Windows browser (panel on `127.0.0.1`)
+      to the VM address, also after two reboots: the address changed and
+      `radio-network.service` recreated the backend (`logs/network-*.log`).
+- [ ] No LAN host reaches `<VM address>:8189/udp`.
+- [ ] Mirrored mode (only on Windows 11 22H2+): `LIVE_PUBLIC_IPS=127.0.0.1`
+      and a live session work.
+- [ ] Media folder through the drive mount: files appear as
+      `radio:radio-media` with group write; a transcode ("Fix loudness")
+      writes a fixed file and the rename succeeds; Cyrillic and Armenian file
+      names import; time the first import of the whole folder.
+- [ ] Arguments with spaces and Cyrillic (the media folder) reach
+      `radioctl first-run --media-root` unchanged through `wsl.exe --exec`;
+      its prompts appear in the install window and secrets are not echoed.
+- [ ] The media folder checks: a network share, a mapped drive, a removable
+      drive, and an external USB disk are refused (`DriveInfo`,
+      `Get-Partition | Get-Disk` bus type).
+- [ ] The Defender exclusion is listed (`Get-MpPreference`); the folder has
+      "contents indexed" off.
+- [ ] The preflight log shows the edition, the newest KB with its date, and
+      the ESU status (the ESU license query may not see a consumer ESU
+      enrolment: compare with Settings > Windows Update).
+- [ ] Settings > Windows Update shows the chosen active hours and does not
+      adjust them automatically (`SmartActiveHoursState=0`); no Pro-only
+      policy is set.
+- [ ] Power: no sleep or hibernation on AC (`powercfg /a`, `/q`); Fast
+      Startup is off, so a shutdown is a cold boot.
+- [ ] Time: `w32tm /query /status` shows the NTP peers; Windows and WSL
+      clocks differ by less than 1 s (`date -u` in WSL against Windows).
+- [ ] The desktop shortcuts open the panel, Grafana, the media folder, and
+      `update.bat`.
+- [ ] The daily backup timer runs after a reboot and the Windows copy
+      appears in `C:\RadioAtlantida\backups` (D6).
+- [ ] **Cold-reboot test:** power the machine off and on with nobody signed
+      in. Within **5 minutes of power-on** the stack is healthy (before the
+      cut-over: every service except `liquidsoap`; after it, Liquidsoap
+      connected to the server). `logs/boot-*.log` gives the VM uptime when
+      it was healthy; add the time from power-on to the VM start (Windows
+      boot time: `(Get-CimInstance Win32_OperatingSystem).LastBootUpTime`,
+      and the keep-alive task's history). Then sign in as `radio` and run
+      `update.bat status`.
+- [ ] The Pester tests pass under Windows PowerShell 5.1 (D7 CI on a Windows
+      runner).
